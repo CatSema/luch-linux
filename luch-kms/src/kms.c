@@ -289,7 +289,7 @@ int luch_kms_main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--codec") && i + 1 < argc) { i++; codec_name = !strcmp(argv[i], "hevc") ? "hevc_vaapi" : "h264_vaapi"; }
     }
     prctl(PR_SET_PDEATHSIG, SIGTERM); // die with luchd
-    const char *scale_env = getenv("LUCH_SCALE");
+    const char *scale_env = getenv("LUCH_ASPECT");
     int scale_mode = !scale_env ? SCALE_FIT : !strcmp(scale_env, "fill") ? SCALE_FILL : !strcmp(scale_env, "stretch") ? SCALE_STRETCH : SCALE_FIT;
 
     // The card driving a display: LUCH_KMS_CARD, or the first /dev/dri/cardN with an active plane.
@@ -393,7 +393,7 @@ int luch_kms_main(int argc, char **argv) {
             glUniform1i(glGetUniformLocation(progs[i], "has_cur"), cs != NULL);
             glUniform4fv(glGetUniformLocation(progs[i], "crect"), 1, rect);
         }
-        // Scale the source into the encoded frame. LUCH_SCALE: "fit" (default) keeps the aspect ratio and adds black bars
+        // Scale the source into the encoded frame. LUCH_ASPECT: "fit" (default) keeps the aspect ratio and adds black bars
         // (a 21:9 screen on a 16:9 receiver); "fill" keeps it and crops the overflow; "stretch" fills the frame, distorted.
         // Even offsets and sizes keep the chroma plane aligned.
         float fit = scale_mode == SCALE_FILL ? fmaxf((float)W / sw, (float)H / sh) : fminf((float)W / sw, (float)H / sh);
