@@ -10,5 +10,5 @@ pub const APP: &str = concat!("luchd/", env!("CARGO_PKG_VERSION"));
 pub const DBUS_NAME: &str = "dev.luch.Luch1";
 pub const DBUS_PATH: &str = "/dev/luch/Luch1";
 
-/// D-Bus row: id, name, model, address, ifname, port, connected.
-pub type ReceiverRow = (String, String, String, String, String, u16, bool);
+/// D-Bus row: id, name, model, address, ifname, port, connected, mirroring.
+pub type ReceiverRow = (String, String, String, String, String, u16, bool, bool);

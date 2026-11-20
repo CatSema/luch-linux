@@ -8,13 +8,16 @@ trait Luch1 {
     fn receivers(&self) -> zbus::Result<Vec<ReceiverRow>>;
     fn connect(&self, id: &str) -> zbus::Result<String>;
     fn disconnect(&self, id: &str) -> zbus::Result<()>;
+    fn mirror(&self, id: &str, source: &str) -> zbus::Result<()>;
+    fn stop_mirror(&self, id: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | connect <id|name> | disconnect <id|name> | watch | id]   (no args: interactive)";
+const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [monitor|window|virtual] | stop <r> | watch | id]
+       <r> = receiver id or name; no arguments: interactive";
 
 fn print(rows: &[ReceiverRow]) {
     if rows.is_empty() {
@@ -22,8 +25,8 @@ fn print(rows: &[ReceiverRow]) {
         return;
     }
     println!("{:<38} {:<20} {:<16} {:<21} {:<10} STATE", "ID", "NAME", "MODEL", "ADDRESS", "IFACE");
-    for (id, name, model, addr, ifname, port, connected) in rows {
-        let state = if *connected { "connected" } else { "-" };
+    for (id, name, model, addr, ifname, port, connected, mirroring) in rows {
+        let state = if *mirroring { "mirroring" } else if *connected { "connected" } else { "-" };
         println!("{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {state}", format!("{addr}:{port}"));
     }
 }
@@ -54,6 +57,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             println!("{pretty}");
         }
         ["disconnect", key] => p.disconnect(&find_id(&p, key).await?).await.map_err(e)?,
+        ["mirror", key] => p.mirror(&find_id(&p, key).await?, "monitor").await.map_err(e)?,
+        ["mirror", key, source] => p.mirror(&find_id(&p, key).await?, source).await.map_err(e)?,
+        ["stop", key] => p.stop_mirror(&find_id(&p, key).await?).await.map_err(e)?,
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
             print(&p.receivers().await.map_err(e)?);
@@ -74,11 +80,11 @@ fn draw(rows: &[ReceiverRow], note: &str) {
     if rows.is_empty() {
         println!("  (searching…)");
     }
-    for (i, (_, name, model, addr, ifname, port, connected)) in rows.iter().enumerate() {
-        let mark = if *connected { "●" } else { "○" };
+    for (i, (_, name, model, addr, ifname, port, connected, mirroring)) in rows.iter().enumerate() {
+        let mark = if *mirroring { "▶" } else if *connected { "●" } else { "○" };
         println!("  {} {mark} {name:<24} {model:<14} {addr}:{port} ({ifname})", i + 1);
     }
-    println!("\n  <N> connect/disconnect · r refresh · q quit");
+    println!("\n  <N> connect/disconnect · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · q quit");
     if !note.is_empty() {
         println!("  {note}");
     }
@@ -102,6 +108,19 @@ async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
                 let Ok(Some(line)) = line else { break };
                 let cmd = line.trim();
                 note.clear();
+                let pick = |n: &str| n.parse::<usize>().ok().filter(|n| (1..=rows.len()).contains(n)).map(|n| &rows[n - 1]);
+                let action = cmd.get(..1).zip(cmd.get(1..)).and_then(|(a, n)| Some((a, pick(n)?)));
+                if let Some((a @ ("m" | "w" | "e" | "s"), (id, name, ..))) = action {
+                    let r = match a {
+                        "s" => p.stop_mirror(id).await.map(|_| "stopped"),
+                        "w" => p.mirror(id, "window").await.map(|_| "mirroring a window"),
+                        "e" => p.mirror(id, "virtual").await.map(|_| "extending the desktop"),
+                        _ => p.mirror(id, "monitor").await.map(|_| "mirroring"),
+                    };
+                    note = match r { Ok(s) => format!("{name}: {s}"), Err(err) => format!("{name}: {err}") };
+                    rows = p.receivers().await?;
+                    continue;
+                }
                 match (cmd, cmd.parse::<usize>()) {
                     ("q", _) => break,
                     (_, Ok(n)) if (1..=rows.len()).contains(&n) => {

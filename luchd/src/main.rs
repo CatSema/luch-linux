@@ -1,15 +1,18 @@
 //! luchd — Luch v0 sender daemon: announces `_luchsrc._tcp`, browses `_luch._tcp`
-//! receivers via Avahi's D-Bus API, keeps control channels, exposes dev.luch.Luch1.
+//! receivers via Avahi's D-Bus API, keeps control channels, mirrors the screen, exposes dev.luch.Luch1.
+
+mod mirror;
 
 use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use luch_proto::{self as p, ReceiverRow};
+use mirror::Cmd;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpSocket},
-    sync::{mpsc, Mutex},
+    sync::{broadcast, mpsc, Mutex},
     time::{timeout, Instant},
 };
 use zbus::{
@@ -37,10 +40,18 @@ struct Receiver {
     service: String, // Avahi instance name, for ItemRemove
 }
 
+/// A live control channel: commands to it, receiver messages (ready, keyframe, stop, ...) from it.
+#[derive(Clone)]
+struct Conn {
+    cmd: mpsc::Sender<Cmd>,
+    events: broadcast::Sender<Value>,
+}
+
 #[derive(Default)]
 struct State {
     found: HashMap<String, Receiver>,
-    conns: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
+    conns: HashMap<String, Conn>,
+    mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -58,8 +69,8 @@ impl Luch {
             .found
             .values()
             .map(|r| {
-                let c = st.conns.contains_key(&r.id);
-                (r.id.clone(), r.name.clone(), r.model.clone(), r.address.clone(), r.ifname.clone(), r.port, c)
+                let (c, m) = (st.conns.contains_key(&r.id), st.mirrors.contains_key(&r.id));
+                (r.id.clone(), r.name.clone(), r.model.clone(), r.address.clone(), r.ifname.clone(), r.port, c, m)
             })
             .collect();
         rows.sort();
@@ -78,17 +89,64 @@ impl Luch {
         let (welcome, rd, wr) = handshake(&r, &self.sender_id, &self.host)
             .await
             .map_err(|e| fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname)))?;
-        let (tx, rx) = mpsc::channel(1);
-        self.st.lock().await.conns.insert(id.clone(), tx);
+        let (tx, rx) = mpsc::channel(8);
+        let (events, _) = broadcast::channel(16);
+        self.st.lock().await.conns.insert(id.clone(), Conn { cmd: tx, events: events.clone() });
         eprintln!("[luchd] connected to {} ({}:{} via {})", r.name, r.address, r.port, r.ifname);
         changed(conn).await;
-        tokio::spawn(run_channel(r.name, id, rd, wr, rx, self.st.clone(), conn.clone()));
+        tokio::spawn(run_channel(r.name, id, rd, wr, rx, events, self.st.clone(), conn.clone()));
         Ok(welcome.to_string())
     }
 
     async fn disconnect(&self, id: String) -> fdo::Result<()> {
-        let tx = self.st.lock().await.conns.get(&id).cloned();
-        let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not connected: {id}")))?;
+        let c = self.st.lock().await.conns.get(&id).cloned();
+        let c = c.ok_or_else(|| fdo::Error::InvalidArgs(format!("not connected: {id}")))?;
+        let _ = c.cmd.send(Cmd::Bye).await;
+        Ok(())
+    }
+
+    /// Mirror to a receiver (connecting first if needed). `source`: "monitor", "window" or "virtual"
+    /// (a new GNOME virtual monitor, i.e. extend). Returns once the stream is set up; the portal
+    /// picker is shown the first time, later runs reuse the saved restore token.
+    async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        let source = match source.as_str() {
+            "" | "monitor" => ashpd::desktop::screencast::SourceType::MONITOR,
+            "window" => ashpd::desktop::screencast::SourceType::WINDOW,
+            "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
+            s => return Err(fdo::Error::InvalidArgs(format!("source must be monitor|window|virtual, not {s}"))),
+        };
+        if self.st.lock().await.mirrors.contains_key(&id) {
+            return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
+        }
+        if !self.st.lock().await.conns.contains_key(&id) {
+            self.connect(id.clone(), conn).await?;
+        }
+        let (c, r) = {
+            let st = self.st.lock().await;
+            (st.conns.get(&id).cloned(), st.found.get(&id).cloned())
+        };
+        let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+        let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
+        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source };
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        self.st.lock().await.mirrors.insert(id.clone(), stop_tx);
+        changed(conn).await;
+        let (st, conn) = (self.st.clone(), conn.clone());
+        tokio::spawn(async move {
+            let res = mirror::run(target, c.cmd, c.events.subscribe(), stop_rx).await;
+            match res {
+                Ok(why) => eprintln!("[luchd] {}: mirroring ended ({why})", r.name),
+                Err(e) => eprintln!("[luchd] {}: mirroring failed: {e}", r.name),
+            }
+            st.lock().await.mirrors.remove(&id);
+            changed(&conn).await;
+        });
+        Ok(())
+    }
+
+    async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
+        let tx = self.st.lock().await.mirrors.get(&id).cloned();
+        let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
         let _ = tx.send(()).await;
         Ok(())
     }
@@ -162,7 +220,8 @@ async fn run_channel(
     id: String,
     mut rd: Reader,
     mut wr: OwnedWriteHalf,
-    mut stop: mpsc::Receiver<()>,
+    mut cmds: mpsc::Receiver<Cmd>,
+    events: broadcast::Sender<Value>,
     st: Shared,
     conn: Connection,
 ) {
@@ -189,10 +248,17 @@ async fn run_channel(
     tick.tick().await;
     let why = loop {
         tokio::select! {
-            _ = stop.recv() => {
-                let _ = send(&mut wr, &json!({"t": "bye"})).await;
-                break "disconnect requested";
-            }
+            c = cmds.recv() => match c {
+                Some(Cmd::Send(v)) => {
+                    if send(&mut wr, &v).await.is_err() {
+                        break "write failed";
+                    }
+                }
+                Some(Cmd::Bye) | None => {
+                    let _ = send(&mut wr, &json!({"t": "bye"})).await;
+                    break "disconnect requested";
+                }
+            },
             _ = tick.tick() => {
                 if last_rx.elapsed() >= DEAD_AFTER {
                     break "silent for 30 s";
@@ -213,7 +279,13 @@ async fn run_channel(
                         }
                     }
                     "bye" => break "bye from receiver",
-                    "error" => eprintln!("[luchd] {name}: error {v}"),
+                    "error" => {
+                        eprintln!("[luchd] {name}: error {v}");
+                        let _ = events.send(v);
+                    }
+                    "ready" | "keyframe" | "stop" | "stats" => {
+                        let _ = events.send(v);
+                    }
                     t => {
                         let _ = send(&mut wr, &json!({"t": "error", "code": "unknown", "for": t})).await;
                     }
@@ -239,6 +311,25 @@ fn ifname(index: i32) -> String {
     }
     // SAFETY: on success the buffer holds a NUL-terminated name.
     unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+/// tun/wg/ppp: point-to-point links (IFF_POINTOPOINT = 0x10).
+fn is_tunnel(ifname: &str) -> bool {
+    let flags = std::fs::read_to_string(format!("/sys/class/net/{ifname}/flags")).unwrap_or_default();
+    u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).is_ok_and(|f| f & 0x10 != 0)
+}
+
+/// Interface of the main-table default route (the physical LAN, even under a full-tunnel VPN).
+fn lan_iface() -> String {
+    std::fs::read_to_string("/proc/net/route")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .find_map(|l| {
+            let p: Vec<_> = l.split_whitespace().collect();
+            (p.get(1) == Some(&"00000000")).then(|| p[0].to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn txt_map(txt: &[Vec<u8>]) -> HashMap<String, String> {
@@ -336,9 +427,12 @@ async fn discover(sys: Connection, st: Shared, conn: Connection) -> zbus::Result
         tokio::spawn(async move {
             match resolve(&sys, iface, proto, &name, &ty, &domain).await {
                 Ok(Some(r)) => {
+                    if is_tunnel(&r.ifname) {
+                        return; // Avahi happily announces on VPN tunnels; never stream through one
+                    }
                     let mut s = st.lock().await;
-                    // ponytail: same id on several interfaces (a local stub, docker bridges) -> first one wins.
-                    if s.found.get(&r.id).is_some_and(|old| old.ifindex != r.ifindex) {
+                    // Same id on several interfaces (a local stub, docker bridges): keep the LAN one.
+                    if s.found.get(&r.id).is_some_and(|old| old.ifindex != r.ifindex && (old.ifname == lan_iface() || r.ifname != lan_iface())) {
                         return;
                     }
                     eprintln!("[luchd] found: {} id={} {}:{} via {}", r.name, r.id, r.address, r.port, r.ifname);
@@ -356,19 +450,25 @@ async fn discover(sys: Connection, st: Shared, conn: Connection) -> zbus::Result
 
 // ---------- identity ----------
 
-fn sender_id() -> io::Result<String> {
+/// ~/.config/luch (created on demand).
+pub(crate) fn config_dir() -> io::Result<std::path::PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no HOME"))?
         .join("luch");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn sender_id() -> io::Result<String> {
+    let dir = config_dir()?;
     let path = dir.join("id");
     if let Ok(s) = std::fs::read_to_string(&path) {
         if !s.trim().is_empty() {
             return Ok(s.trim().to_string());
         }
     }
-    std::fs::create_dir_all(&dir)?;
     let id = uuid::Uuid::new_v4().to_string();
     std::fs::write(&path, format!("{id}\n"))?;
     Ok(id)
@@ -381,6 +481,7 @@ fn short_host() -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    gstreamer::init()?;
     let id = sender_id()?;
     let host = short_host();
     let st = Shared::default();
