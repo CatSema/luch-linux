@@ -1,1 +1,5 @@
 target/
+/vendor/
+/.cargo/
+/.gear/
+/luch.spec
