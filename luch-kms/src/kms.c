@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -125,7 +126,7 @@ typedef struct { VASurfaceID id; GLuint fbo[2]; } Target;
 static Target targets[16]; static int n_targets;
 
 /// Imported scanout buffer, keyed by KMS framebuffer id (the compositor cycles a few of them).
-typedef struct { uint32_t fb_id; GLuint tex; EGLImage img; int fd; int w, h; } Source;
+typedef struct { uint32_t fb_id; ino_t ino; GLuint tex; EGLImage img; int fd; int w, h; } Source;
 /// Separate caches: a new cursor buffer must never evict the primary buffer being sampled.
 typedef struct { Source s[8]; int next; } Cache;
 static Cache primary_cache, cursor_cache;
@@ -159,23 +160,30 @@ static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
 }
 
 static Source *source_for(Cache *cache, EGLDisplay d, int card, uint32_t fb_id, int *w, int *h) {
+    // KMS recycles framebuffer ids for new buffers, so the cache key is the buffer itself:
+    // the DMA-BUF inode is stable per GEM object. A stale hit would replay an old frame.
     Source *sources = cache->s;
-    for (int i = 0; i < 8; i++) if (sources[i].fb_id == fb_id && sources[i].tex) { *w = sources[i].w; *h = sources[i].h; return &sources[i]; }
     drmModeFB2 *fb = drmModeGetFB2(card, fb_id);
     if (!fb || !fb->handles[0]) { if (fb) drmModeFreeFB2(fb); return NULL; }
     int fd = -1;
     drmPrimeHandleToFD(card, fb->handles[0], DRM_CLOEXEC | DRM_RDWR, &fd);
-    int np = 0; while (np < 4 && fb->handles[np]) np++;
-    EGLImage img = egl_import(d, fd, fb->pixel_format, fb->width, fb->height, fb->modifier, np, fb->offsets, fb->pitches);
-    *w = fb->width; *h = fb->height;
     for (int i = 0; i < 4; i++) if (fb->handles[i] && (i == 0 || fb->handles[i] != fb->handles[0])) {
         struct drm_gem_close gc = { .handle = fb->handles[i] }; drmIoctl(card, DRM_IOCTL_GEM_CLOSE, &gc);
     }
+    struct stat st;
+    ino_t ino = (fd >= 0 && fstat(fd, &st) == 0) ? st.st_ino : 0;
+    for (int i = 0; i < 8; i++) if (sources[i].tex && sources[i].fb_id == fb_id && sources[i].ino == ino) {
+        close(fd); drmModeFreeFB2(fb);
+        *w = sources[i].w; *h = sources[i].h; return &sources[i];
+    }
+    int np = 0; while (np < 4 && fb->handles[np]) np++;
+    EGLImage img = egl_import(d, fd, fb->pixel_format, fb->width, fb->height, fb->modifier, np, fb->offsets, fb->pitches);
+    *w = fb->width; *h = fb->height;
     drmModeFreeFB2(fb);
     if (img == EGL_NO_IMAGE) { close(fd); return NULL; }
     Source *s = &sources[cache->next++ % 8];
     if (s->tex) { glDeleteTextures(1, &s->tex); eglDestroyImage(d, s->img); close(s->fd); }
-    s->fb_id = fb_id; s->img = img; s->fd = fd; s->w = *w; s->h = *h;
+    s->fb_id = fb_id; s->ino = ino; s->img = img; s->fd = fd; s->w = *w; s->h = *h;
     glGenTextures(1, &s->tex); glBindTexture(GL_TEXTURE_EXTERNAL_OES, s->tex);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
