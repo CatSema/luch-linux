@@ -47,6 +47,8 @@ pub struct Target {
     pub address: Ipv4Addr,
     pub ifname: String,
     pub source: SourceType,
+    /// Full screen straight from KMS scanout via the privileged luch-kms helper (lowest latency).
+    pub kms: bool,
 }
 
 /// Messages to the control-channel task.
@@ -156,20 +158,23 @@ async fn portal(source: SourceType) -> Result<(Screencast, ashpd::desktop::Sessi
     Ok((sc, session, fd, node))
 }
 
-fn pipeline(fd: i32, node: u32) -> Result<gst::Pipeline, String> {
+/// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
+fn pipeline(portal: Option<(i32, u32)>) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
     let scale = std::env::var("LUCH_SCALE").unwrap_or_else(|_| "fast".into());
     let drm = std::env::var("LUCH_DRM_FORMAT").unwrap_or_else(|_| "NV12:0x0100000000000009".into());
     // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
-    let desc = format!(
+    let video = portal.map(|(fd, node)| format!(
         "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
            ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
            ! vapostproc scale-method={scale} \
            ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={WIDTH},height={HEIGHT} \
-           ! appsink name=v sync=false max-buffers=1 drop=true \
-         pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true buffer-time=10000 latency-time={lat} \
+           ! appsink name=v sync=false max-buffers=1 drop=true "
+    )).unwrap_or_default();
+    let desc = format!(
+        "{video} pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true buffer-time=10000 latency-time={lat} \
            ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
            ! opusenc audio-type=restricted-lowdelay frame-size={AUDIO_FRAME_MS} bitrate={AUDIO_BPS} bitrate-type=cbr \
            ! appsink name=a sync=false",
@@ -231,17 +236,20 @@ fn render_node() -> String {
 }
 
 /// Hooks both appsinks to the UDP senders; returns the "force an IDR" flag.
-fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
+/// Hooks the appsinks to the UDP senders; returns the "force an IDR" flag and the "resend OpusHead"
+/// flag (set on every video IDR). Without a "v" sink only audio is wired.
+fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     let need_head = Arc::new(AtomicBool::new(true));
     let want_idr = Arc::new(AtomicBool::new(false));
     let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
     let warned = AtomicBool::new(false);
     let dbg = Mutex::new((0f64, 0f64, 0u32));
-    let vsink = p.by_name("v").unwrap().downcast::<gst_app::AppSink>().unwrap();
     let asink = p.by_name("a").unwrap().downcast::<gst_app::AppSink>().unwrap();
+    let nh_audio = need_head.clone();
 
     let nh = need_head.clone();
     let wi = want_idr.clone();
+    if let Some(vsink) = p.by_name("v").and_then(|v| v.downcast::<gst_app::AppSink>().ok()) {
     vsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             // vapostproc only hands out DMA-BUFs to a peer that understands VideoMeta (plane offsets/strides).
@@ -302,6 +310,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
             })
             .build(),
     );
+    }
     asink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |s| {
@@ -309,7 +318,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
                 let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let (pts, lat) = timing(s, buf.pts());
-                if need_head.swap(false, Ordering::Relaxed) {
+                if nh_audio.swap(false, Ordering::Relaxed) {
                     audio.send_frame(&opus_head(), F_CONFIG, pts, 0);
                 }
                 audio.send_frame(&map, 0, pts, lat);
@@ -317,7 +326,52 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
             })
             .build(),
     );
-    want_idr
+    (want_idr, need_head)
+}
+
+/// Lowest-latency video: spawns luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) and forwards its
+/// packets as they come. Returns the child; write b"k" to its stdin to force an IDR.
+fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>) -> Result<std::process::Child, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
+    let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
+    let mut child = Command::new(&exe)
+        .args(["--size", &format!("{WIDTH}x{HEIGHT}"), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
+    let mut out = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut hdr = [0u8; 13];
+        let mut buf = Vec::new();
+        let mut base: Option<u64> = None;
+        while out.read_exact(&mut hdr).is_ok() {
+            let len = u32::from_be_bytes(hdr[0..4].try_into().unwrap()) as usize;
+            let idr = hdr[4] & 1 != 0;
+            let cap = u64::from_be_bytes(hdr[5..13].try_into().unwrap());
+            buf.resize(len, 0);
+            if out.read_exact(&mut buf).is_err() {
+                break;
+            }
+            let now = mono_us();
+            let base = *base.get_or_insert(cap);
+            let lat = (now.saturating_sub(cap) / 100).min(u16::MAX as u64) as u16; // scanout flip -> encoded
+            if idr {
+                need_head.store(true, Ordering::Relaxed);
+            }
+            video.send_frame(&buf, if idr { F_IDR } else { 0 }, cap - base, lat);
+        }
+    });
+    Ok(child)
+}
+
+fn mono_us() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid out-pointer for clock_gettime.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as u64 * 1_000_000 + t.tv_nsec as u64 / 1000
 }
 
 /// Debug: average (running time - capture pts) at the src pad of each video element, printed every second.
@@ -362,7 +416,7 @@ pub async fn run(
     mut stop: mpsc::Receiver<()>,
     stats: Stats,
 ) -> Result<&'static str, String> {
-    let (_sc, session, fd, node) = portal(t.source).await?;
+    let portal = if t.kms { None } else { Some(portal(t.source).await?) };
 
     let start = json!({"t": "start", "mode": "mirror",
         "video": {"codec": "video/avc", "width": WIDTH, "height": HEIGHT, "fps": FPS},
@@ -387,8 +441,9 @@ pub async fn run(
     let video = Arc::new(Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40).map_err(io)?);
     let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
 
-    let p = pipeline(fd.as_raw_fd(), node)?;
-    let want_idr = wire(&p, video.clone(), audio);
+    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)))?;
+    let (want_idr, need_head) = wire(&p, video.clone(), audio);
+    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head)?) } else { None };
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -431,7 +486,13 @@ pub async fn run(
                 break Ok("stopped");
             }
             ev = events.recv() => match ev {
-                Ok(v) if v["t"] == "keyframe" => want_idr.store(true, Ordering::Relaxed),
+                Ok(v) if v["t"] == "keyframe" => {
+                    want_idr.store(true, Ordering::Relaxed);
+                    if let Some(k) = kms.as_mut().and_then(|k| k.stdin.as_mut()) {
+                        use std::io::Write;
+                        let _ = k.write_all(b"k");
+                    }
+                }
                 Ok(v) if v["t"] == "stats" => rx_stats = v,
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => break Ok("stopped by receiver"),
@@ -449,8 +510,14 @@ pub async fn run(
         }
     };
     let _ = p.set_state(gst::State::Null);
-    let _ = session.close().await;
-    drop(fd);
+    if let Some(mut k) = kms {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+    if let Some((_sc, session, fd, _)) = portal {
+        let _ = session.close().await;
+        drop(fd);
+    }
     why
 }
 

@@ -14,7 +14,7 @@
 #include <time.h>
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
-static double t_map, t_send, t_recv; static int t_n;
+static double t_map, t_send; static int t_n;
 
 typedef struct LuchEnc {
     AVBufferRef *drm_dev, *va_dev, *drm_frames, *va_frames;

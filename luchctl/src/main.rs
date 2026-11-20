@@ -17,7 +17,7 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [monitor|window|virtual] | stop <r> | stats <r> | watch | id]
+const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [fast|monitor|window|virtual] | stop <r> | stats <r> | watch | id]
        <r> = receiver id or name; no arguments: interactive";
 
 fn print(rows: &[ReceiverRow]) {
@@ -110,7 +110,7 @@ fn draw(rows: &[ReceiverRow], stats: &[(usize, String)], note: &str) {
             println!("      {line}");
         }
     }
-    println!("\n  <N> connect/disconnect · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · q quit");
+    println!("\n  <N> connect/disconnect · f<N> fast full screen · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · q quit");
     if !note.is_empty() {
         println!("  {note}");
     }
@@ -142,9 +142,10 @@ async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
                 note.clear();
                 let pick = |n: &str| n.parse::<usize>().ok().filter(|n| (1..=rows.len()).contains(n)).map(|n| &rows[n - 1]);
                 let action = cmd.get(..1).zip(cmd.get(1..)).and_then(|(a, n)| Some((a, pick(n)?)));
-                if let Some((a @ ("m" | "w" | "e" | "s"), (id, name, ..))) = action {
+                if let Some((a @ ("f" | "m" | "w" | "e" | "s"), (id, name, ..))) = action {
                     let r = match a {
                         "s" => p.stop_mirror(id).await.map(|_| "stopped"),
+                        "f" => p.mirror(id, "fast").await.map(|_| "mirroring full screen, lowest latency"),
                         "w" => p.mirror(id, "window").await.map(|_| "mirroring a window"),
                         "e" => p.mirror(id, "virtual").await.map(|_| "extending the desktop"),
                         _ => p.mirror(id, "monitor").await.map(|_| "mirroring"),

@@ -111,11 +111,12 @@ impl Luch {
     /// (a new GNOME virtual monitor, i.e. extend). Returns once the stream is set up; the portal
     /// picker is shown the first time, later runs reuse the saved restore token.
     async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        let kms = source == "fast";
         let source = match source.as_str() {
-            "" | "monitor" => ashpd::desktop::screencast::SourceType::MONITOR,
+            "" | "monitor" | "fast" => ashpd::desktop::screencast::SourceType::MONITOR,
             "window" => ashpd::desktop::screencast::SourceType::WINDOW,
             "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
-            s => return Err(fdo::Error::InvalidArgs(format!("source must be monitor|window|virtual, not {s}"))),
+            s => return Err(fdo::Error::InvalidArgs(format!("source must be fast|monitor|window|virtual, not {s}"))),
         };
         if self.st.lock().await.mirrors.contains_key(&id) {
             return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
@@ -129,7 +130,7 @@ impl Luch {
         };
         let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
         let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source };
+        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms };
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let stats = mirror::Stats::default();
         {
