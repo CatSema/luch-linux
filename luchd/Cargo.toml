@@ -13,7 +13,12 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 futures-util = "0.3"
 gstreamer = "0.25.4"
-gstreamer-app = "0.25.2"
+gstreamer-app = { version = "0.25.2", features = ["v1_24"] }
 gstreamer-video = "0.25.4"
 ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "screencast"] }
 socket2 = { version = "0.6.5", features = ["all"] }
+gstreamer-allocators = "0.25.4"
+
+[build-dependencies]
+cc = "1.11.3"
+pkg-config = "0.3.34"

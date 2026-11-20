@@ -1,6 +1,7 @@
 //! luchd — Luch v0 sender daemon: announces `_luchsrc._tcp`, browses `_luch._tcp`
 //! receivers via Avahi's D-Bus API, keeps control channels, mirrors the screen, exposes dev.luch.Luch1.
 
+mod enc;
 mod mirror;
 
 use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};

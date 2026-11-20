@@ -158,17 +158,16 @@ async fn portal(source: SourceType) -> Result<(Screencast, ashpd::desktop::Sessi
 
 fn pipeline(fd: i32, node: u32) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
-    let cpb = VIDEO_KBPS / FPS; // one-frame CPB: no frame may overshoot the link by more than one frame
-    // ponytail: LUCH_SRC_CAPS is an experiment knob for capture negotiation; drop it once settled.
-    let src_caps = std::env::var("LUCH_SRC_CAPS").unwrap_or_else(|_| "video/x-raw".into());
+    // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
+    // list when other GPUs matter.
+    let drm = std::env::var("LUCH_DRM_FORMAT").unwrap_or_else(|_| "NV12:0x0100000000000009".into());
+    // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
     let desc = format!(
-        "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=true keepalive-time={keepalive} \
-           ! {src_caps} ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
+        "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
+           ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
            ! vapostproc add-borders=true \
-           ! video/x-raw(memory:VAMemory),format=NV12,width={WIDTH},height={HEIGHT} \
-           ! vah264enc rate-control=vbr bitrate={VIDEO_KBPS} cpb-size={cpb} key-int-max=1024 b-frames=0 ref-frames=1 target-usage=7 \
-           ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-           ! appsink name=v sync=false \
+           ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={WIDTH},height={HEIGHT} \
+           ! appsink name=v sync=false max-buffers=1 drop=true \
          pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true buffer-time=10000 latency-time={lat} \
            ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
            ! opusenc audio-type=restricted-lowdelay frame-size={AUDIO_FRAME_MS} bitrate={AUDIO_BPS} bitrate-type=cbr \
@@ -193,24 +192,99 @@ fn timing(sink: &gst_app::AppSink, pts: Option<gst::ClockTime>) -> (u64, u16) {
     (pts.useconds(), lat.min(u16::MAX as u64) as u16)
 }
 
-fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> gst_app::AppSink {
+/// fd, modifier, plane offsets and pitches of an NV12 DMA-BUF sample.
+fn dmabuf_of(sample: &gst::Sample) -> Result<crate::enc::Nv12Dmabuf, String> {
+    let buf = sample.buffer().ok_or("no buffer")?;
+    let caps = sample.caps().ok_or("no caps")?;
+    let drm = caps.structure(0).and_then(|s| s.get::<String>("drm-format").ok()).ok_or("no drm-format")?;
+    let (fourcc, modifier) = drm.split_once(':').unwrap_or((&drm, "0x0"));
+    if fourcc != "NV12" {
+        return Err(format!("expected NV12, got {drm}"));
+    }
+    let modifier = u64::from_str_radix(modifier.trim_start_matches("0x"), 16).map_err(|e| e.to_string())?;
+    if buf.n_memory() != 1 {
+        return Err(format!("{} memories, expected 1", buf.n_memory()));
+    }
+    let mem = buf.peek_memory(0);
+    let dmabuf = mem.downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>().ok_or("not a DMA-BUF")?;
+    let meta = buf.meta::<gstreamer_video::VideoMeta>().ok_or("no video meta")?;
+    let (off, stride) = (meta.offset(), meta.stride());
+    Ok(crate::enc::Nv12Dmabuf {
+        fd: dmabuf.fd(),
+        modifier,
+        offsets: [off[0] as u32, off[1] as u32],
+        pitches: [stride[0] as u32, stride[1] as u32],
+    })
+}
+
+fn render_node() -> String {
+    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().to_string_lossy().into_owned())
+        .filter(|p| p.contains("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.into_iter().next().unwrap_or_else(|| "/dev/dri/renderD128".into())
+}
+
+/// Hooks both appsinks to the UDP senders; returns the "force an IDR" flag.
+fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
     let need_head = Arc::new(AtomicBool::new(true));
+    let want_idr = Arc::new(AtomicBool::new(false));
+    let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
+    let warned = AtomicBool::new(false);
     let vsink = p.by_name("v").unwrap().downcast::<gst_app::AppSink>().unwrap();
     let asink = p.by_name("a").unwrap().downcast::<gst_app::AppSink>().unwrap();
 
     let nh = need_head.clone();
+    let wi = want_idr.clone();
     vsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
+            // vapostproc only hands out DMA-BUFs to a peer that understands VideoMeta (plane offsets/strides).
+            .propose_allocation(|_, query| {
+                query.add_allocation_meta::<gstreamer_video::VideoMeta>(None);
+                true
+            })
             .new_sample(move |s| {
+                // Runs on the capture thread: encode and send right here, no queue in between.
                 let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let idr = !buf.flags().contains(gst::BufferFlags::DELTA_UNIT);
-                if idr {
-                    nh.store(true, Ordering::Relaxed); // receiver may have (re)started its audio decoder
+                let report = |e: String| {
+                    if !warned.swap(true, Ordering::Relaxed) {
+                        eprintln!("[luchd] video: {e}");
+                    }
+                };
+                let frame = match dmabuf_of(&sample) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        report(e);
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                };
+                let pts_rt = sample.buffer().and_then(|b| b.pts());
+                let mut enc = encoder.lock().unwrap();
+                if enc.is_none() {
+                    match crate::enc::Encoder::open(&render_node(), WIDTH, HEIGHT, FPS, VIDEO_KBPS) {
+                        Ok(e) => *enc = Some(e),
+                        Err(e) => {
+                            report(e);
+                            return Err(gst::FlowError::Error);
+                        }
+                    }
                 }
-                let (pts, lat) = timing(s, buf.pts());
-                video.send_frame(&map, if idr { F_IDR } else { 0 }, pts, lat);
+                let force = wi.swap(false, Ordering::Relaxed);
+                let (pts, _) = timing(s, pts_rt);
+                let r = enc.as_mut().unwrap().encode(&frame, pts as i64, force, |bytes, idr| {
+                    if idr {
+                        nh.store(true, Ordering::Relaxed); // receiver may have (re)started its audio decoder
+                    }
+                    let (_, lat) = timing(s, pts_rt); // capture -> encoded, measured after encode
+                    video.send_frame(bytes, if idr { F_IDR } else { 0 }, pts, lat);
+                });
+                if let Err(e) = r {
+                    report(e);
+                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -230,16 +304,41 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> gst_app::AppSink {
             })
             .build(),
     );
-    vsink
+    want_idr
+}
+
+/// Debug: average (running time - capture pts) at the src pad of each video element, printed every second.
+fn probe_stages(p: &gst::Pipeline) {
+    const ENC_OFFSET: gst::ClockTime = gst::ClockTime::from_seconds(1000 * 3600);
+    let mut it = p.iterate_recurse();
+    while let Ok(Some(el)) = it.next() {
+        let name = el.name().to_string();
+        if !["pipewiresrc", "queue", "capsfilter", "vapostproc", "vah264enc", "h264parse"].iter().any(|k| name.starts_with(k)) {
+            continue;
+        }
+        let Some(pad) = el.static_pad("src") else { continue };
+        let acc = std::sync::Mutex::new((0f64, 0u32, std::time::Instant::now()));
+        let el2 = el.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(buf) = info.buffer() {
+                if let (Some(pts), Some(now)) = (buf.pts(), el2.current_running_time()) {
+                    let pts = if pts >= ENC_OFFSET { pts - ENC_OFFSET } else { pts };
+                    let mut a = acc.lock().unwrap();
+                    a.0 += now.saturating_sub(pts).nseconds() as f64 / 1e6;
+                    a.1 += 1;
+                    if a.2.elapsed().as_secs() >= 1 {
+                        eprintln!("[probe] {:<14} {:6.1} ms  ({} bufs)", el2.name(), a.0 / a.1 as f64, a.1);
+                        *a = (0.0, 0, std::time::Instant::now());
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 }
 
 fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
-}
-
-fn force_idr(vsink: &gst_app::AppSink) {
-    let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-    vsink.send_event(ev);
 }
 
 /// Runs one mirroring session until stopped (by us, the receiver, or an error).
@@ -276,7 +375,10 @@ pub async fn run(
     let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
 
     let p = pipeline(fd.as_raw_fd(), node)?;
-    let vsink = wire(&p, video.clone(), audio);
+    let want_idr = wire(&p, video.clone(), audio);
+    if std::env::var_os("LUCH_PROBE").is_some() {
+        probe_stages(&p);
+    }
     if let Err(e) = p.set_state(gst::State::Playing) {
         let detail = p.bus().and_then(|b| b.timed_pop_filtered(gst::ClockTime::from_mseconds(500), &[gst::MessageType::Error]));
         let _ = p.set_state(gst::State::Null);
@@ -304,7 +406,7 @@ pub async fn run(
                 let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
                 (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
-                                    "fps": df, "mbps": round1(mbps), "encoder": "vah264enc", "res": format!("{WIDTH}x{HEIGHT}")});
+                                    "fps": df, "mbps": round1(mbps), "encoder": "h264_vaapi", "res": format!("{WIDTH}x{HEIGHT}")});
                 let _ = cmd.send(Cmd::Send(sender.clone())).await;
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
@@ -316,7 +418,7 @@ pub async fn run(
                 break Ok("stopped");
             }
             ev = events.recv() => match ev {
-                Ok(v) if v["t"] == "keyframe" => force_idr(&vsink),
+                Ok(v) if v["t"] == "keyframe" => want_idr.store(true, Ordering::Relaxed),
                 Ok(v) if v["t"] == "stats" => rx_stats = v,
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => break Ok("stopped by receiver"),
