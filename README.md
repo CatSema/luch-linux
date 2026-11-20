@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/luch.svg" width="128" alt="Luch"></p>
+
 # Luch — Linux sender
 
 [Русская версия](README.ru.md) · Receiver: [luch-android](https://github.com/Toxblh/luch-android)
@@ -22,6 +24,8 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 | `luchctl` | CLI and interactive terminal screen. |
 | `gnome-extension/` | GNOME Shell Quick Settings toggle «Luch». |
 | `docs/dbus.md` | D-Bus API reference. |
+
+![luchctl: receivers and live latency](docs/img/luchctl.png)
 
 ## Mirroring modes
 

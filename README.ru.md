@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/luch.svg" width="128" alt="Luch"></p>
+
 # Луч — передатчик для Linux
 
 [English version](README.md) · Приёмник: [luch-android](https://github.com/Toxblh/luch-android)
@@ -22,6 +24,8 @@ Sunshine/Moonlight: служба находит приёмники в локал
 | `luchctl` | Командная строка и интерактивный экран в терминале. |
 | `gnome-extension/` | Переключатель «Луч» в быстрых настройках GNOME Shell. |
 | `docs/dbus.ru.md` | Описание D-Bus API. |
+
+![luchctl: приёмники и задержка в реальном времени](docs/img/luchctl.png)
 
 ## Режимы трансляции
 

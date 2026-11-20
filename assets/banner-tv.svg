@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1A2340"/>
+      <stop offset="1" stop-color="#2B1742"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFF4D6" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#FFB547" stop-opacity="0.25"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFE7A6"/>
+      <stop offset="1" stop-color="#FF8F3A"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFE7A8" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#FFE7A8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="360" fill="url(#bg)"/>
+  <g transform="translate(50.400000000000006 65.0) scale(0.44921875)">
+  
+  
+  <!-- light cone from the lens to the screen's silhouette corners -->
+  <path d="M118 396 L196 104 L436 252 Z" fill="url(#beam)"/>
+  <!-- screen, 16:9 -->
+  <rect x="196" y="104" width="240" height="148" rx="18" fill="url(#screen)"/>
+  <rect x="214" y="122" width="204" height="112" rx="10" fill="#FFF6DC" fill-opacity="0.35"/>
+  <!-- lens -->
+  <circle cx="118" cy="396" r="74" fill="url(#glow)"/>
+  <circle cx="118" cy="396" r="36" fill="#FFFFFF"/>
+  <circle cx="118" cy="396" r="17" fill="#FFC85C"/>
+</g>
+  <text x="323.59999999999997" y="176.5" font-family="Adwaita Sans, Cantarell, sans-serif" font-weight="700" font-size="70" fill="#FFF3D6">Луч</text>
+  <text x="323.59999999999997" y="228.0" font-family="Adwaita Sans, Cantarell, sans-serif" font-size="26" fill="#FFC27A">Luch · screen mirroring</text>
+</svg>

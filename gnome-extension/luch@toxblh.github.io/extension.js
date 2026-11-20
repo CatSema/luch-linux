@@ -21,7 +21,7 @@ const IFACE = `<node>
 </node>`;
 const LuchProxy = Gio.DBusProxy.makeProxyWrapper(IFACE);
 
-const ICON = 'video-display-symbolic';
+let ICON = null; // Gio.Icon from the extension dir, set in enable()
 
 // ponytail: two-language table instead of gettext; switch to gettext when a third language arrives.
 const RU = GLib.get_language_names().some(l => l.startsWith('ru'));
@@ -54,7 +54,7 @@ const T = RU ? {
 const LuchToggle = GObject.registerClass(
 class LuchToggle extends QuickMenuToggle {
     _init(onMirroringChanged) {
-        super._init({title: T.title, iconName: ICON, toggleMode: false});
+        super._init({title: T.title, gicon: ICON, toggleMode: false});
         this._onMirroringChanged = onMirroringChanged;
         this._rows = [];
         this._lastId = null;
@@ -107,7 +107,10 @@ class LuchToggle extends QuickMenuToggle {
         }
         for (const [id, name, model, , , , connected, isMirroring] of this._rows) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(name, true);
-            sub.icon.icon_name = isMirroring ? 'media-playback-start-symbolic' : ICON;
+            if (isMirroring)
+                sub.icon.icon_name = 'media-playback-start-symbolic';
+            else
+                sub.icon.gicon = ICON;
             if (model)
                 sub.label.text = `${name} · ${model}`;
             const add = (label, fn) => sub.menu.addAction(label, () => fn().catch(e => logError(e, 'Luch')));
@@ -189,7 +192,7 @@ class LuchIndicator extends SystemIndicator {
     _init() {
         super._init();
         this._icon = this._addIndicator();
-        this._icon.icon_name = ICON;
+        this._icon.gicon = ICON;
         this._icon.visible = false;
         this.quickSettingsItems.push(new LuchToggle(on => {
             this._icon.visible = on;
@@ -204,6 +207,7 @@ class LuchIndicator extends SystemIndicator {
 
 export default class LuchExtension extends Extension {
     enable() {
+        ICON = Gio.icon_new_for_string(`${this.path}/luch-symbolic.svg`);
         this._indicator = new LuchIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
@@ -211,5 +215,6 @@ export default class LuchExtension extends Extension {
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
+        ICON = null;
     }
 }
