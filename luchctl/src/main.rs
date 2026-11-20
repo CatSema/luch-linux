@@ -17,8 +17,10 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [fast|monitor|window|virtual] | stop <r> | stats <r> | watch | id]
-       <r> = receiver id or name; no arguments: interactive";
+const USAGE: &str = "usage: luchctl [list | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id]
+       r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive";
+
+const SOURCES: [&str; 4] = ["fast", "monitor", "window", "virtual"];
 
 fn print(rows: &[ReceiverRow]) {
     if rows.is_empty() {
@@ -32,8 +34,16 @@ fn print(rows: &[ReceiverRow]) {
     }
 }
 
-async fn find_id(p: &Luch1Proxy<'_>, key: &str) -> Result<String, String> {
+/// Receiver by id or name; with no key, the only receiver on the LAN.
+async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String> {
     let rows = p.receivers().await.map_err(|e| e.to_string())?;
+    let Some(key) = key else {
+        return match rows.as_slice() {
+            [one] => Ok(one.0.clone()),
+            [] => Err("no receivers found (is the receiver app running?)".into()),
+            _ => Err(format!("{} receivers on the LAN, name one (see `luchctl list`)", rows.len())),
+        };
+    };
     let hits: Vec<_> = rows.iter().filter(|r| r.0 == key || r.1.eq_ignore_ascii_case(key)).collect();
     match hits.as_slice() {
         [one] => Ok(one.0.clone()),
@@ -49,25 +59,30 @@ async fn run(args: &[String]) -> Result<(), String> {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["list"] => print(&p.receivers().await.map_err(e)?),
         ["id"] => println!("{}", p.sender_id().await.map_err(e)?),
-        ["connect", key] => {
-            let id = find_id(&p, key).await?;
+        ["connect", key @ ..] if key.len() <= 1 => {
+            let id = find_id(&p, key.first().copied()).await?;
             let welcome = p.connect(&id).await.map_err(e)?;
             let pretty = serde_json::from_str::<serde_json::Value>(&welcome)
                 .and_then(|v| serde_json::to_string_pretty(&v))
                 .unwrap_or(welcome);
             println!("{pretty}");
         }
-        ["disconnect", key] => p.disconnect(&find_id(&p, key).await?).await.map_err(e)?,
-        ["mirror", key] => p.mirror(&find_id(&p, key).await?, "monitor").await.map_err(e)?,
-        ["mirror", key, source] => p.mirror(&find_id(&p, key).await?, source).await.map_err(e)?,
-        ["stats", key] => {
-            let id = find_id(&p, key).await?;
+        ["disconnect", key @ ..] if key.len() <= 1 => p.disconnect(&find_id(&p, key.first().copied()).await?).await.map_err(e)?,
+        ["mirror"] => p.mirror(&find_id(&p, None).await?, "fast").await.map_err(e)?,
+        // `mirror fast` with a single receiver: a known source word that isn't a receiver name.
+        ["mirror", one] if SOURCES.contains(one) && find_id(&p, Some(one)).await.is_err() => {
+            p.mirror(&find_id(&p, None).await?, one).await.map_err(e)?
+        }
+        ["mirror", key] => p.mirror(&find_id(&p, Some(key)).await?, "fast").await.map_err(e)?,
+        ["mirror", key, source] => p.mirror(&find_id(&p, Some(key)).await?, source).await.map_err(e)?,
+        ["stats", key @ ..] if key.len() <= 1 => {
+            let id = find_id(&p, key.first().copied()).await?;
             loop {
                 println!("{}", stats_line(&p.stats(&id).await.map_err(e)?));
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        ["stop", key] => p.stop_mirror(&find_id(&p, key).await?).await.map_err(e)?,
+        ["stop", key @ ..] if key.len() <= 1 => p.stop_mirror(&find_id(&p, key.first().copied()).await?).await.map_err(e)?,
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
             print(&p.receivers().await.map_err(e)?);

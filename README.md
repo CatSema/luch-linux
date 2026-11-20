@@ -123,9 +123,10 @@ estimated latency. On the TV, press OK on the remote to show the statistics over
 ```sh
 luchctl                                   # interactive: list, f<N> fast, m<N> screen, w<N> window, e<N> extend, s<N> stop
 luchctl list
-luchctl mirror "XGIMI MoGo 4 Laser" fast  # or monitor | window | virtual
-luchctl stats "XGIMI MoGo 4 Laser"        # live latency, fps, bitrate
-luchctl stop "XGIMI MoGo 4 Laser"
+luchctl mirror                            # fast mode; the receiver name is optional when there is only one
+luchctl mirror "XGIMI MoGo 4 Laser" window # or monitor | window | virtual
+luchctl stats                             # live latency, fps, bitrate
+luchctl stop
 ```
 
 **Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md).

@@ -125,9 +125,10 @@ gnome-extensions enable luch@toxblh.github.io           # на Wayland — по�
 ```sh
 luchctl                                   # интерактивно: список, f<N> fast, m<N> экран, w<N> окно, e<N> расширить, s<N> стоп
 luchctl list
-luchctl mirror "XGIMI MoGo 4 Laser" fast  # или monitor | window | virtual
-luchctl stats "XGIMI MoGo 4 Laser"        # задержка, fps, битрейт в реальном времени
-luchctl stop "XGIMI MoGo 4 Laser"
+luchctl mirror                            # fast mode; имя приёмника можно не указывать, если он один
+luchctl mirror "XGIMI MoGo 4 Laser" window # или monitor | window | virtual
+luchctl stats                             # задержка, fps, битрейт в реальном времени
+luchctl stop
 ```
 
 **Свой интерфейс:** всё доступно на сессионной шине, см. [docs/dbus.ru.md](docs/dbus.ru.md).
