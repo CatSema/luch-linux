@@ -1,0 +1,25 @@
+Categories:
+  - Connectivity
+  - Multimedia
+License: GPL-3.0-or-later
+AuthorName: Anton Palgunov
+SourceCode: https://github.com/Toxblh/luch-android
+IssueTracker: https://github.com/Toxblh/luch-android/issues
+
+AutoName: Luch
+
+RepoType: git
+Repo: https://github.com/Toxblh/luch-android.git
+
+Builds:
+  - versionName: '0.2'
+    versionCode: 2
+    commit: v0.2
+    subdir: android/app
+    gradle:
+      - yes
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: '0.2'
+CurrentVersionCode: 2
