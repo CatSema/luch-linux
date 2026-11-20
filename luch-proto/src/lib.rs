@@ -1,0 +1,14 @@
+//! Luch protocol v0 constants shared by luchd and luchctl.
+
+pub const VERSION: u32 = 0;
+pub const RECEIVER_TYPE: &str = "_luch._tcp";
+pub const SENDER_TYPE: &str = "_luchsrc._tcp";
+pub const CONTROL_PORT: u16 = 47800;
+pub const MAX_LINE: usize = 64 * 1024;
+pub const APP: &str = concat!("luchd/", env!("CARGO_PKG_VERSION"));
+
+pub const DBUS_NAME: &str = "dev.luch.Luch1";
+pub const DBUS_PATH: &str = "/dev/luch/Luch1";
+
+/// D-Bus row: id, name, model, address, ifname, port, connected.
+pub type ReceiverRow = (String, String, String, String, String, u16, bool);
