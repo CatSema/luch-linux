@@ -148,8 +148,13 @@ impl Luch {
         }
         changed(conn).await;
         let (st, conn) = (self.st.clone(), conn.clone());
+        // Subscribe here and drop our copy of the sender: the mirror must see the channel close
+        // (receiver gone or restarted) instead of streaming into the void.
+        let Conn { cmd, events } = c;
+        let events_rx = events.subscribe();
+        drop(events);
         tokio::spawn(async move {
-            let res = mirror::run(target, c.cmd, c.events.subscribe(), stop_rx, stats).await;
+            let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
             match res {
                 Ok(why) => eprintln!("[luchd] {}: mirroring ended ({why})", r.name),
                 Err(e) => eprintln!("[luchd] {}: mirroring failed: {e}", r.name),
