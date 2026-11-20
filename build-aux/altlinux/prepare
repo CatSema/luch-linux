@@ -1,0 +1,10 @@
+#!/bin/bash -ex
+# Prepares the gear tree for hasher: the build is offline, so the Rust crates are vendored here.
+mkdir -p .gear .cargo
+cp build-aux/altlinux/rules .gear/rules
+cargo vendor --locked vendor > .cargo/config.toml
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' luchd/Cargo.toml | head -1)
+release="0.$(date +%s)"
+sed -e "s/@VERSION@/${version//-/.}/g" -e "s/@RELEASE@/${release}/g" \
+    build-aux/altlinux/luch.spec.in > luch.spec
+add_changelog -e '- Regular build.' luch.spec
