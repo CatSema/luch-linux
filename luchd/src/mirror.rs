@@ -49,6 +49,8 @@ pub struct Target {
     pub source: SourceType,
     /// Full screen straight from KMS scanout via the privileged luch-kms helper (lowest latency).
     pub kms: bool,
+    /// Receiver's preferred decoder from its welcome bench ("video/hevc" or "video/avc").
+    pub prefer: String,
 }
 
 /// Messages to the control-channel task.
@@ -331,13 +333,14 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, 
 
 /// Lowest-latency video: spawns luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) and forwards its
 /// packets as they come. Returns the child; write b"k" to its stdin to force an IDR.
-fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>) -> Result<std::process::Child, String> {
+fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool) -> Result<std::process::Child, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
     let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
     let mut child = Command::new(&exe)
         .args(["--size", &format!("{WIDTH}x{HEIGHT}"), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
+        .args(["--codec", if hevc { "hevc" } else { "h264" }])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -418,8 +421,10 @@ pub async fn run(
 ) -> Result<&'static str, String> {
     let portal = if t.kms { None } else { Some(portal(t.source).await?) };
 
+    // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
+    let hevc = t.kms && t.prefer == "video/hevc";
     let start = json!({"t": "start", "mode": "mirror",
-        "video": {"codec": "video/avc", "width": WIDTH, "height": HEIGHT, "fps": FPS},
+        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": WIDTH, "height": HEIGHT, "fps": FPS},
         "audio": {"codec": "audio/opus", "rate": 48000, "channels": 2, "frame_ms": AUDIO_FRAME_MS}});
     cmd.send(Cmd::Send(start)).await.map_err(|_| "control channel closed")?;
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -443,7 +448,7 @@ pub async fn run(
 
     let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)))?;
     let (want_idr, need_head) = wire(&p, video.clone(), audio);
-    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head)?) } else { None };
+    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc)?) } else { None };
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -474,7 +479,7 @@ pub async fn run(
                 let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
                 (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
-                                    "fps": df, "mbps": round1(mbps), "encoder": "h264_vaapi", "res": format!("{WIDTH}x{HEIGHT}")});
+                                    "fps": df, "mbps": round1(mbps), "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{WIDTH}x{HEIGHT}")});
                 let _ = cmd.send(Cmd::Send(sender.clone())).await;
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);

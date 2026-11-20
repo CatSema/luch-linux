@@ -54,6 +54,7 @@ struct State {
     conns: HashMap<String, Conn>,
     mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
     stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
+    welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -93,7 +94,11 @@ impl Luch {
             .map_err(|e| fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname)))?;
         let (tx, rx) = mpsc::channel(8);
         let (events, _) = broadcast::channel(16);
-        self.st.lock().await.conns.insert(id.clone(), Conn { cmd: tx, events: events.clone() });
+        {
+            let mut st = self.st.lock().await;
+            st.conns.insert(id.clone(), Conn { cmd: tx, events: events.clone() });
+            st.welcomes.insert(id.clone(), welcome.clone());
+        }
         eprintln!("[luchd] connected to {} ({}:{} via {})", r.name, r.address, r.port, r.ifname);
         changed(conn).await;
         tokio::spawn(run_channel(r.name, id, rd, wr, rx, events, self.st.clone(), conn.clone()));
@@ -130,7 +135,8 @@ impl Luch {
         };
         let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
         let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms };
+        let prefer = self.st.lock().await.welcomes.get(&id).and_then(|w| w["bench"]["prefer"].as_str()).unwrap_or("video/avc").to_string();
+        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer };
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let stats = mirror::Stats::default();
         {

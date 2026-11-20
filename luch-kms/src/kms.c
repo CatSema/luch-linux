@@ -262,11 +262,13 @@ int luch_kms_main(int argc, char **argv) {
     const char *card_path = getenv("LUCH_KMS_CARD") ? getenv("LUCH_KMS_CARD") : "/dev/dri/card1";
     const char *render = getenv("LUCH_KMS_RENDER") ? getenv("LUCH_KMS_RENDER") : "/dev/dri/renderD128";
     int W = 1920, H = 1080, FPS = 60, KBPS = 20000, bench = 0;
+    const char *codec_name = "h264_vaapi";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bench")) bench = 1;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &W, &H);
         else if (!strcmp(argv[i], "--kbps") && i + 1 < argc) KBPS = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) FPS = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--codec") && i + 1 < argc) { i++; codec_name = !strcmp(argv[i], "hevc") ? "hevc_vaapi" : "h264_vaapi"; }
     }
     prctl(PR_SET_PDEATHSIG, SIGTERM); // die with luchd
 
@@ -298,7 +300,8 @@ int luch_kms_main(int argc, char **argv) {
     AVHWFramesContext *pf = (void *)pool->data;
     pf->format = AV_PIX_FMT_VAAPI; pf->sw_format = AV_PIX_FMT_NV12; pf->width = W; pf->height = H; pf->initial_pool_size = 6;
     ck(av_hwframe_ctx_init(pool), "surface pool");
-    const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
+    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
+    if (!codec) DIE("%s not available", codec_name);
     AVCodecContext *c = avcodec_alloc_context3(codec);
     c->width = W; c->height = H; c->time_base = (AVRational){1, 1000000}; c->framerate = (AVRational){FPS, 1};
     c->pix_fmt = AV_PIX_FMT_VAAPI; c->hw_frames_ctx = av_buffer_ref(pool);
@@ -310,9 +313,9 @@ int luch_kms_main(int argc, char **argv) {
     AVDictionary *o = NULL;
     av_dict_set(&o, "async_depth", "1", 0); av_dict_set(&o, "rc_mode", "VBR", 0);
     av_dict_set(&o, "idr_interval", "2147483647", 0); av_dict_set(&o, "sei", "0", 0);
-    ck(avcodec_open2(c, codec, &o), "open h264_vaapi");
+    ck(avcodec_open2(c, codec, &o), codec_name);
     av_dict_free(&o);
-    fprintf(stderr, "luch-kms: plane %u -> %dx%d h264 %d kbps (EGL convert, VA encode)\n", plane, W, H, KBPS);
+    fprintf(stderr, "luch-kms: plane %u -> %dx%d %s %d kbps (EGL convert, VA encode)\n", plane, W, H, codec_name, KBPS);
 
     AVPacket *pkt = av_packet_alloc();
     uint32_t last_fb = 0;
