@@ -9,7 +9,7 @@
 // Needs CAP_SYS_ADMIN for drmModeGetFB2 handles (as Sunshine's kmsgrab).
 // stdout: packets, each [u32 len BE][u8 flags: bit0 IDR][u64 capture_us BE (CLOCK_MONOTONIC)][len bytes]
 // stdin:  'k' = force IDR, EOF = quit.   --bench: no output, timing on stderr.
-// ponytail: the hardware cursor plane is not composited yet (Sunshine blends it; add when needed).
+// The hardware cursor plane is read alongside and blended in the shader (as Sunshine does).
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define EGL_EGLEXT_PROTOTYPES
 #define GL_GLEXT_PROTOTYPES
@@ -102,12 +102,18 @@ static GLuint program(const char *frag) {
 
 // BT.709 limited range. The scanout texture is sampled as external (any modifier/format).
 #define FRAG_HEAD "#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\nprecision highp float;\n" \
-                  "uniform samplerExternalOES src; in vec2 uv; out vec4 o;\n"
+                  "uniform samplerExternalOES src; uniform samplerExternalOES cur; uniform vec4 crect; uniform bool has_cur;\n" \
+                  "in vec2 uv; out vec4 o;\n" \
+                  "vec3 px() { vec3 c = texture(src, uv).rgb;\n" \
+                  "  if (has_cur) { vec2 q = (uv - crect.xy) / crect.zw;\n" \
+                  "    if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThan(q, vec2(1.0)))) {\n" \
+                  "      vec4 k = texture(cur, q); c = k.rgb + c * (1.0 - k.a); } }\n" \
+                  "  return c; }\n"
 static const char *FRAG_Y = FRAG_HEAD
-    "void main() { vec3 c = texture(src, uv).rgb;\n"
+    "void main() { vec3 c = px();\n"
     "  o = vec4(dot(c, vec3(0.2126, 0.7152, 0.0722)) * (219.0/255.0) + 16.0/255.0, 0.0, 0.0, 1.0); }\n";
 static const char *FRAG_UV = FRAG_HEAD
-    "void main() { vec3 c = texture(src, uv).rgb;\n"
+    "void main() { vec3 c = px();\n"
     "  float u = dot(c, vec3(-0.1146, -0.3854, 0.5)) * (224.0/255.0) + 128.0/255.0;\n"
     "  float v = dot(c, vec3(0.5, -0.4542, -0.0458)) * (224.0/255.0) + 128.0/255.0;\n"
     "  o = vec4(u, v, 0.0, 1.0); }\n";
@@ -119,7 +125,7 @@ typedef struct { VASurfaceID id; GLuint fbo[2]; } Target;
 static Target targets[16]; static int n_targets;
 
 /// Imported scanout buffer, keyed by KMS framebuffer id (the compositor cycles a few of them).
-typedef struct { uint32_t fb_id; GLuint tex; EGLImage img; int fd; } Source;
+typedef struct { uint32_t fb_id; GLuint tex; EGLImage img; int fd; int w, h; } Source;
 static Source sources[8]; static int src_next;
 
 static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
@@ -151,7 +157,7 @@ static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
 }
 
 static Source *source_for(EGLDisplay d, int card, uint32_t fb_id, int *w, int *h) {
-    for (int i = 0; i < 8; i++) if (sources[i].fb_id == fb_id && sources[i].tex) return &sources[i];
+    for (int i = 0; i < 8; i++) if (sources[i].fb_id == fb_id && sources[i].tex) { *w = sources[i].w; *h = sources[i].h; return &sources[i]; }
     drmModeFB2 *fb = drmModeGetFB2(card, fb_id);
     if (!fb || !fb->handles[0]) { if (fb) drmModeFreeFB2(fb); return NULL; }
     int fd = -1;
@@ -166,12 +172,69 @@ static Source *source_for(EGLDisplay d, int card, uint32_t fb_id, int *w, int *h
     if (img == EGL_NO_IMAGE) { close(fd); return NULL; }
     Source *s = &sources[src_next++ % 8];
     if (s->tex) { glDeleteTextures(1, &s->tex); eglDestroyImage(d, s->img); close(s->fd); }
-    s->fb_id = fb_id; s->img = img; s->fd = fd;
+    s->fb_id = fb_id; s->img = img; s->fd = fd; s->w = *w; s->h = *h;
     glGenTextures(1, &s->tex); glBindTexture(GL_TEXTURE_EXTERNAL_OES, s->tex);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     img_to_tex(GL_TEXTURE_EXTERNAL_OES, img);
     return s;
+}
+
+/// Atomic property ids of a plane, looked up once by name.
+typedef struct { uint32_t id, fb, x, y, w, h; } PlaneProps;
+
+static uint64_t prop_by_name(int fd, uint32_t obj, const char *name, uint32_t *prop_id) {
+    drmModeObjectProperties *pr = drmModeObjectGetProperties(fd, obj, DRM_MODE_OBJECT_PLANE);
+    uint64_t v = 0;
+    for (uint32_t i = 0; pr && i < pr->count_props; i++) {
+        drmModePropertyRes *r = drmModeGetProperty(fd, pr->props[i]);
+        if (r && !strcmp(r->name, name)) { v = pr->prop_values[i]; if (prop_id) *prop_id = r->prop_id; }
+        drmModeFreeProperty(r);
+    }
+    drmModeFreeObjectProperties(pr);
+    return v;
+}
+
+/// The cursor plane that can sit on the primary plane's CRTC (0 if none).
+static uint32_t find_cursor(int fd, uint32_t primary, PlaneProps *pp) {
+    drmModePlane *pl = drmModeGetPlane(fd, primary);
+    drmModeRes *res = drmModeGetResources(fd);
+    int idx = -1;
+    for (int i = 0; res && i < res->count_crtcs; i++) if (res->crtcs[i] == pl->crtc_id) idx = i;
+    drmModeFreeResources(res); drmModeFreePlane(pl);
+    drmModePlaneRes *pr = drmModeGetPlaneResources(fd);
+    uint32_t found = 0;
+    for (uint32_t i = 0; pr && i < pr->count_planes && !found; i++) {
+        drmModePlane *p = drmModeGetPlane(fd, pr->planes[i]);
+        if (p && idx >= 0 && (p->possible_crtcs & (1u << idx)) && prop_by_name(fd, p->plane_id, "type", NULL) == DRM_PLANE_TYPE_CURSOR)
+            found = p->plane_id;
+        drmModeFreePlane(p);
+    }
+    drmModeFreePlaneResources(pr);
+    if (found) {
+        pp->id = found;
+        prop_by_name(fd, found, "FB_ID", &pp->fb); prop_by_name(fd, found, "CRTC_X", &pp->x);
+        prop_by_name(fd, found, "CRTC_Y", &pp->y); prop_by_name(fd, found, "CRTC_W", &pp->w);
+        prop_by_name(fd, found, "CRTC_H", &pp->h);
+    }
+    return found;
+}
+
+/// Current cursor state: fb (0 = hidden) and its rectangle on the CRTC in pixels.
+typedef struct { uint32_t fb; int64_t x, y, w, h; } Cursor;
+static Cursor read_cursor(int fd, const PlaneProps *pp) {
+    Cursor c = {0};
+    drmModeObjectProperties *pr = drmModeObjectGetProperties(fd, pp->id, DRM_MODE_OBJECT_PLANE);
+    for (uint32_t i = 0; pr && i < pr->count_props; i++) {
+        uint32_t id = pr->props[i]; uint64_t v = pr->prop_values[i];
+        if (id == pp->fb) c.fb = (uint32_t)v;
+        else if (id == pp->x) c.x = (int64_t)v; // CRTC_X/Y are signed (cursor may hang off the edge)
+        else if (id == pp->y) c.y = (int64_t)v;
+        else if (id == pp->w) c.w = (int64_t)v;
+        else if (id == pp->h) c.h = (int64_t)v;
+    }
+    drmModeFreeObjectProperties(pr);
+    return c;
 }
 
 /// The biggest active plane: the desktop's primary plane on the main monitor.
@@ -211,8 +274,18 @@ int luch_kms_main(int argc, char **argv) {
     uint32_t plane = find_plane(card);
     if (!plane) DIE("no active plane on %s (needs CAP_SYS_ADMIN)", card_path);
 
+    PlaneProps cpp = {0};
+    uint32_t cursor_plane = find_cursor(card, plane, &cpp);
+    if (!cursor_plane) fprintf(stderr, "luch-kms: no cursor plane; the cursor will be missing unless the compositor draws it\n");
+
     EGLDisplay egl = egl_init();
     GLuint prog_y = program(FRAG_Y), prog_uv = program(FRAG_UV);
+    GLuint progs[2] = { prog_y, prog_uv };
+    for (int i = 0; i < 2; i++) {
+        glUseProgram(progs[i]);
+        glUniform1i(glGetUniformLocation(progs[i], "src"), 0);
+        glUniform1i(glGetUniformLocation(progs[i], "cur"), 1);
+    }
 
     // Encoder and its NV12 surface pool (the GL passes render straight into these surfaces).
     AVBufferRef *drm_dev = NULL, *va_dev = NULL;
@@ -240,6 +313,7 @@ int luch_kms_main(int argc, char **argv) {
 
     AVPacket *pkt = av_packet_alloc();
     uint32_t last_fb = 0;
+    Cursor last_cur = {0};
     int force_idr = 0, frames = 0;
     double s_grab = 0, s_conv = 0, s_enc = 0;
     int64_t last_out = 0, stat_t = mono_us();
@@ -259,18 +333,31 @@ int luch_kms_main(int argc, char **argv) {
         if (!p) continue;
         uint32_t fb_id = p->fb_id;
         drmModeFreePlane(p);
-        if (!fb_id || (fb_id == last_fb && t0 - last_out < keepalive_us && !force_idr)) continue;
-        last_fb = fb_id;
+        // A moving hardware cursor doesn't flip the primary plane, so it counts as a change too.
+        Cursor cur = cursor_plane ? read_cursor(card, &cpp) : (Cursor){0};
+        int cur_moved = memcmp(&cur, &last_cur, sizeof cur) != 0;
+        if (!fb_id || (fb_id == last_fb && !cur_moved && t0 - last_out < keepalive_us && !force_idr)) continue;
+        last_fb = fb_id; last_cur = cur;
         int sw = 0, sh = 0;
         Source *s = source_for(egl, card, fb_id, &sw, &sh);
         if (!s) continue;
+        int cw = 0, ch = 0;
+        Source *cs = cur.fb ? source_for(egl, card, cur.fb, &cw, &ch) : NULL;
 
         AVFrame *f = av_frame_alloc();
         ck(av_hwframe_get_buffer(pool, f, 0), "surface");
         Target *t = target_for(egl, f, W, H);
         int64_t t1 = mono_us();
 
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, s->tex);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_EXTERNAL_OES, s->tex);
+        if (cs) { glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_EXTERNAL_OES, cs->tex); }
+        // Cursor rectangle in source UV space; CRTC_W/H is the plane size (the cursor buffer is cropped to it).
+        float rect[4] = { (float)cur.x / sw, (float)cur.y / sh, (float)(cur.w ? cur.w : cw) / sw, (float)(cur.h ? cur.h : ch) / sh };
+        for (int i = 0; i < 2; i++) {
+            glUseProgram(progs[i]);
+            glUniform1i(glGetUniformLocation(progs[i], "has_cur"), cs != NULL);
+            glUniform4fv(glGetUniformLocation(progs[i], "crect"), 1, rect);
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[0]); glViewport(0, 0, W, H);
         glUseProgram(prog_y); glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[1]); glViewport(0, 0, W / 2, H / 2);

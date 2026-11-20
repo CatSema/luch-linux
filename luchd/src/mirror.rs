@@ -495,7 +495,10 @@ pub async fn run(
                 }
                 Ok(v) if v["t"] == "stats" => rx_stats = v,
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
-                Ok(v) if v["t"] == "stop" => break Ok("stopped by receiver"),
+                Ok(v) if v["t"] == "stop" => {
+                    eprintln!("[luchd] {}: receiver sent {v}", t.name);
+                    break Ok("stopped by receiver");
+                }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break Ok("control channel closed"),
             },
