@@ -12,13 +12,20 @@ import os
 import random
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SL, SR, SY = 230, 282, 362      # beam at the laptop screen
-TL, TR, TY = 120, 392, 90       # beam at the big screen (hidden behind it)
 SCREEN = (120, 76, 272, 153, 18)   # x, y, w, h, r  (16:9)
 INNER = (136, 92, 240, 121, 10)
-LID = (198, 350, 116, 76, 10)
-LID_GLASS = (207, 359, 98, 58, 5)
-BASE = "M170 428 H342 L354 444 Q354 448 348 448 H164 Q158 448 158 444 Z"
+# MacBook-like front view: thin-bezel 16:10 lid, a thin base a bit wider, a scoop in the middle.
+LID = (184, 330, 144, 94, 9)
+LID_GLASS = (191, 337, 130, 81, 3)
+NOTCH = (248, 337, 16, 4, 2)
+BASE = "M166 424 H346 V430 Q346 438 338 438 H174 Q166 438 166 430 Z"
+SCOOP = (236, 424, 40, 4, 2)
+# The beam leaves the whole laptop display and lands on the whole big screen.
+SL, SR, SY = 191, 321, 337      # at the laptop display's top edge
+TL, TR, TY = 136, 376, 229      # inner screen width, at the big screen's bottom edge
+
+
+BASE_A = "M166,424H346V430Q346,438 338,438H174Q166,438 166,430Z"  # BASE in Android path syntax
 
 
 def geometry(seed=11):
@@ -38,7 +45,7 @@ def geometry(seed=11):
 
     dust = []
     for _ in range(22):
-        y = rnd.uniform(236, SY - 14)
+        y = rnd.uniform(TY + 8, SY - 8)
         x = 256 + rnd.uniform(-1, 1) * half_at(y) * 0.85
         dust.append((x, y, rnd.uniform(1.4, 3.6), rnd.uniform(0.35, 0.85)))
     return rays, dust
@@ -79,18 +86,20 @@ def svg_colour(rays, dust):
   <path d="{rrect(*SCREEN)}" fill="url(#screen)"/>
   <path d="{rrect(*INNER)}" fill="#FFF6DC" fill-opacity="0.32"/>
   <path d="{rrect(*LID)}" fill="#E9EDF8"/>
-  <path d="{rrect(*LID_GLASS)}" fill="#FFE7A6"/>
+  <path d="{rrect(*LID_GLASS)}" fill="url(#screen)"/>
+  <path d="{rrect(*NOTCH)}" fill="#1A2340"/>
   <path d="{BASE}" fill="#E9EDF8"/>
+  <path d="{rrect(*SCOOP)}" fill="#B9C0D6"/>
 </svg>
 '''
 
 
 SYMBOLIC = '''<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path d="M7 11 L9 11 L13.5 6 L2.5 6 Z" fill="#222" fill-opacity="0.45"/>
+  <path d="M4.6 10 L11.4 10 L14.5 8 L1.5 8 Z" fill="#222" fill-opacity="0.45"/>
   <rect x="1.5" y="1" width="13" height="7.3" rx="1.2" fill="#222"/>
-  <rect x="5" y="10.5" width="6" height="3.4" rx="0.6" fill="#222"/>
-  <rect x="3.5" y="14.2" width="9" height="1.3" rx="0.6" fill="#222"/>
+  <rect x="4.2" y="9.6" width="7.6" height="4.6" rx="0.7" fill="#222"/>
+  <rect x="3.2" y="14.4" width="9.6" height="1.1" rx="0.5" fill="#222"/>
 </svg>
 '''
 
@@ -116,8 +125,10 @@ def android_foreground(rays, dust):
     p.append(f'<path android:pathData="{rrect(*SCREEN)}">{grad_linear(120, 76, 392, 229, [(0, "#FFFFE7A6"), (1, "#FFFF8F3A")])}</path>')
     p.append(f'<path android:fillColor="#52FFF6DC" android:pathData="{rrect(*INNER)}" />')
     p.append(f'<path android:fillColor="#FFE9EDF8" android:pathData="{rrect(*LID)}" />')
-    p.append(f'<path android:fillColor="#FFFFE7A6" android:pathData="{rrect(*LID_GLASS)}" />')
-    p.append(f'<path android:fillColor="#FFE9EDF8" android:pathData="{BASE.replace(" ", ",").replace(",H", "H").replace(",L", "L").replace(",Q", "Q").replace(",Z", "Z")}" />')
+    p.append(f'<path android:pathData="{rrect(*LID_GLASS)}">{grad_linear(191, 337, 321, 418, [(0, "#FFFFE7A6"), (1, "#FFFF8F3A")])}</path>')
+    p.append(f'<path android:fillColor="#FF1A2340" android:pathData="{rrect(*NOTCH)}" />')
+    p.append(f'<path android:fillColor="#FFE9EDF8" android:pathData="{BASE_A}" />')
+    p.append(f'<path android:fillColor="#FFB9C0D6" android:pathData="{rrect(*SCOOP)}" />')
     return vector(108, 108, "\n        ".join(p), group=True, aapt=True)
 
 
@@ -125,15 +136,15 @@ def android_monochrome():
     p = [f'<path android:fillColor="#FFFFFFFF" android:fillAlpha="0.45" android:pathData="{poly([(SL, SY), (SR, SY), (TR, TY), (TL, TY)])}" />',
          f'<path android:fillColor="#FFFFFFFF" android:pathData="{rrect(*SCREEN)}" />',
          f'<path android:fillColor="#FFFFFFFF" android:pathData="{rrect(*LID)}" />',
-         f'<path android:fillColor="#FFFFFFFF" android:pathData="M170,428H342L354,444Q354,448 348,448H164Q158,448 158,444Z" />']
+         f'<path android:fillColor="#FFFFFFFF" android:pathData="{BASE_A}" />']
     return vector(108, 108, "\n        ".join(p), group=True)
 
 
 def android_notification():
-    p = ['<path android:fillColor="#FFFFFFFF" android:fillAlpha="0.5" android:pathData="M7,11L9,11L13.5,6L2.5,6Z" />',
+    p = ['<path android:fillColor="#FFFFFFFF" android:fillAlpha="0.5" android:pathData="M4.6,10L11.4,10L14.5,8L1.5,8Z" />',
          '<path android:fillColor="#FFFFFFFF" android:pathData="M2.7,1h10.6a1.2,1.2 0,0 1,1.2 1.2v4.9a1.2,1.2 0,0 1,-1.2 1.2h-10.6a1.2,1.2 0,0 1,-1.2 -1.2v-4.9a1.2,1.2 0,0 1,1.2 -1.2z" />',
-         '<path android:fillColor="#FFFFFFFF" android:pathData="M5.6,10.5h4.8a0.6,0.6 0,0 1,0.6 0.6v2.2a0.6,0.6 0,0 1,-0.6 0.6h-4.8a0.6,0.6 0,0 1,-0.6 -0.6v-2.2a0.6,0.6 0,0 1,0.6 -0.6z" />',
-         '<path android:fillColor="#FFFFFFFF" android:pathData="M4.1,14.2h7.8a0.6,0.6 0,0 1,0 1.3h-7.8a0.6,0.6 0,0 1,0 -1.3z" />']
+         '<path android:fillColor="#FFFFFFFF" android:pathData="M4.9,9.6h6.2a0.7,0.7 0,0 1,0.7 0.7v3.2a0.7,0.7 0,0 1,-0.7 0.7h-6.2a0.7,0.7 0,0 1,-0.7 -0.7v-3.2a0.7,0.7 0,0 1,0.7 -0.7z" />',
+         '<path android:fillColor="#FFFFFFFF" android:pathData="M3.7,14.4h8.6a0.5,0.5 0,0 1,0 1.1h-8.6a0.5,0.5 0,0 1,0 -1.1z" />']
     return vector(16, 16, "\n    ".join(p), size_dp=24)
 
 
@@ -164,8 +175,34 @@ def main():
         from gi.repository import GdkPixbuf
         GdkPixbuf.Pixbuf.new_from_file_at_size(os.path.join(HERE, "luch.svg"), 512, 512).savev(
             os.path.join(HERE, "luch.png"), "png", [], [])
-    except Exception as e:  # PNG is optional; the SVG is the source
+        cards()
+    except Exception as e:  # PNGs are optional; the SVGs are the source
         print("png skipped:", e)
+
+
+def cards():
+    """TV banner (640x360, drawable-xhdpi) and F-Droid feature graphic (1024x500) around the icon."""
+    import re
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    inner = re.search(r"<svg[^>]*>(.*)</svg>", open(os.path.join(HERE, "luch.svg")).read(), re.S).group(1)
+    defs = re.search(r"<defs>.*?</defs>", inner, re.S).group(0)
+    body = inner.replace(defs, "").replace('<rect width="512" height="512" rx="112" fill="url(#bg)"/>', "")
+    font = "Adwaita Sans, Cantarell, sans-serif"
+    for out, w, h, icon_px, title, title_px, sub, sub_px in [
+            ("banner-tv", 640, 360, 280, "Луч", 70, "Luch · screen mirroring", 26),
+            ("feature-graphic", 1024, 500, 400, "Луч · Luch", 100, "Linux → TV · ~13 ms", 42)]:
+        s = icon_px / 512
+        ix, iy = h * 0.10, (h - icon_px) / 2
+        tx = ix + icon_px + h * 0.08
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{defs}'
+               f'<rect width="{w}" height="{h}" fill="url(#bg)"/><g transform="translate({ix} {iy}) scale({s})">{body}</g>'
+               f'<text x="{tx}" y="{h / 2 - title_px * 0.05}" font-family="{font}" font-weight="700" font-size="{title_px}" fill="#FFF3D6">{title}</text>'
+               f'<text x="{tx}" y="{h / 2 + sub_px * 1.6}" font-family="{font}" font-size="{sub_px}" fill="#FFC27A">{sub}</text></svg>')
+        write(out + ".svg", svg)
+        GdkPixbuf.Pixbuf.new_from_file_at_size(os.path.join(HERE, out + ".svg"), w, h).savev(
+            os.path.join(HERE, out + ".png"), "png", [], [])
 
 
 def write(name, text):
