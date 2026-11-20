@@ -1,0 +1,138 @@
+# D-Bus API — `dev.luch.Luch1`
+
+[English version](dbus.md)
+
+`luchd` занимает имя **`dev.luch.Luch1`** на **сессионной шине** и обслуживает один объект
+**`/dev/luch/Luch1`** с интерфейсом **`dev.luch.Luch1`**. Всё, что делают `luchctl` и расширение
+GNOME, идёт через него, так что любой другой интерфейс может делать то же самое.
+
+```sh
+gdbus introspect --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
+```
+
+## Приёмники
+
+Приёмник — устройство Луч в локальной сети, найденное через mDNS (`_luch._tcp`, только IPv4,
+через Avahi). Приёмники, видимые только через туннели «точка-точка» (VPN), игнорируются. Если
+приёмник виден на нескольких интерфейсах, берётся основной интерфейс локальной сети. Все сокеты к
+приёмнику привязаны к интерфейсу, на котором он найден, поэтому VPN с полным туннелем поток не
+перехватит.
+
+## Методы
+
+### `Receivers() → a(sssssqbb)`
+
+Возвращает все известные приёмники кортежами:
+
+| # | Тип | Значение |
+|---|-----|----------|
+| 0 | `s` | id приёмника (постоянный UUID из TXT-записи) |
+| 1 | `s` | имя, например `XGIMI MoGo 4 Laser` |
+| 2 | `s` | модель |
+| 3 | `s` | IPv4-адрес |
+| 4 | `s` | сетевой интерфейс, на котором найден |
+| 5 | `q` | порт управления |
+| 6 | `b` | канал управления открыт |
+| 7 | `b` | идёт трансляция |
+
+### `Connect(s id) → s`
+
+Открывает канал управления (TCP, JSON-строки) и держит его, отправляя ping раз в секунду.
+Возвращает сообщение приёмника `welcome` в виде JSON-строки: декодеры, максимальный размер,
+паспорт железа (`hw`) и замер декодеров (`bench`). `Mirror` подключается сам, так что вызывать
+`Connect` необязательно.
+
+Ошибки: `org.freedesktop.DBus.Error.InvalidArgs` для неизвестного id,
+`org.freedesktop.DBus.Error.Failed`, если уже подключено или рукопожатие не удалось.
+
+### `Disconnect(s id)`
+
+Отправляет `bye` и закрывает канал управления. Идущая трансляция останавливается вместе с ним.
+
+### `Mirror(s id, s source)`
+
+Запускает трансляцию на приёмник, при необходимости сначала подключается. Возвращает управление,
+как только сеанс настроен. `source` задаёт способ захвата экрана:
+
+| `source` | Захват | Задержка | Примечания |
+|----------|--------|----------|------------|
+| `fast` | scanout через KMS (помощник `luch-kms`), EGL→NV12, кодирование VA-API | минимальная (≈5–6 мс на передатчике) | весь основной монитор; `luch-kms` нужно право `CAP_SYS_ADMIN` |
+| `monitor` | портал трансляции экрана (PipeWire, DMA-BUF) | ≈15–25 мс на передатчике | GNOME один раз спрашивает, какой экран, потом запоминает |
+| `window` | портал | как у `monitor` | одно окно |
+| `virtual` | портал, виртуальный монитор | как у `monitor` | расширяет рабочий стол новым экраном |
+
+Кодек выбирается по замеру декодеров приёмника (`welcome.bench.prefer`): HEVC, если там он
+быстрее, иначе H.264. Звук (Opus, кадры по 5 мс) во всех режимах берётся с монитора основного
+устройства вывода.
+
+Ошибки: `InvalidArgs` при неверном `source` или неизвестном id, `Failed`, если трансляция уже идёт.
+
+### `StopMirror(s id)`
+
+Останавливает трансляцию и сообщает приёмнику (`stop`). Канал управления остаётся открытым.
+
+### `Stats(s id) → s`
+
+Текущие цифры в JSON, обновляются раз в секунду во время трансляции, иначе `{}`:
+
+```json
+{
+  "est_ms": 13.5,
+  "sender":   {"rtt_ms": 3.7, "host_ms": 5.6, "fps": 45, "mbps": 2.1, "encoder": "hevc_vaapi", "res": "1920x1080"},
+  "receiver": {"decode_ms": 6.0, "fps": 47, "lost": 0, "dropped": 3, "decoder": "OMX.MS.HEVC.Decoder"}
+}
+```
+
+- `rtt_ms` — время туда-обратно для ping канала управления.
+- `host_ms` — от захвата до готового пакета на передатчике (в режиме `fast` — от переключения буфера scanout).
+- `decode_ms` — время декодера, как его сообщает приёмник.
+- `est_ms` — `host_ms + rtt_ms / 2 + decode_ms`; собственная задержка дисплея не учтена.
+
+Те же цифры передатчика уходят приёмнику (`sender_stats`) для его оверлея на экране.
+
+## Сигналы
+
+### `ReceiversChanged()`
+
+Испускается, когда приёмник появился или пропал, а также когда начинается или заканчивается
+подключение или трансляция. Чтобы получить новое состояние, вызовите `Receivers()` ещё раз.
+
+## Свойства
+
+### `SenderId` (`s`, только чтение)
+
+id этой машины (UUID в `~/.config/luch/id`). Он же объявляется как `_luchsrc._tcp`, чтобы
+приёмники могли показать, какие передатчики рядом.
+
+## Примеры
+
+```sh
+# список
+gdbus call --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1 --method dev.luch.Luch1.Receivers
+
+# весь экран с минимальной задержкой, потом остановка
+gdbus call --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1 --method dev.luch.Luch1.Mirror "$ID" fast
+gdbus call --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1 --method dev.luch.Luch1.StopMirror "$ID"
+
+# следить за изменениями
+gdbus monitor --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
+```
+
+Из GJS (так делает расширение GNOME):
+
+```js
+const proxy = Gio.DBusProxy.new_for_bus_sync(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null,
+    'dev.luch.Luch1', '/dev/luch/Luch1', 'dev.luch.Luch1', null);
+const [rows] = proxy.call_sync('Receivers', null, Gio.DBusCallFlags.NONE, -1, null).deepUnpack();
+proxy.call('Mirror', new GLib.Variant('(ss)', [rows[0][0], 'fast']), Gio.DBusCallFlags.NONE, -1, null, null);
+proxy.connectSignal('ReceiversChanged', () => { /* обновить */ });
+```
+
+## Файлы и переменные окружения
+
+| Путь / переменная | Назначение |
+|-------------------|------------|
+| `~/.config/luch/id` | id передатчика |
+| `~/.config/luch/restore-token` | токен портала трансляции (после первого раза без диалога выбора) |
+| `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM-карта и render node для `luch-kms` (по умолчанию `/dev/dri/card1`, `/dev/dri/renderD128`) |
+| `LUCH_PROBE=1` | замеры задержки по этапам в логе `luchd` |

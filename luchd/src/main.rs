@@ -112,9 +112,11 @@ impl Luch {
         Ok(())
     }
 
-    /// Mirror to a receiver (connecting first if needed). `source`: "monitor", "window" or "virtual"
-    /// (a new GNOME virtual monitor, i.e. extend). Returns once the stream is set up; the portal
-    /// picker is shown the first time, later runs reuse the saved restore token.
+    /// Mirror to a receiver (connecting first if needed). `source`:
+    /// "fast" (full screen straight from KMS scanout via luch-kms, lowest latency),
+    /// "monitor", "window" or "virtual" (a new GNOME virtual monitor, i.e. extend) via the
+    /// screencast portal: its picker is shown the first time, later runs reuse a saved token.
+    /// Returns once the session is set up; it then runs until StopMirror or the receiver stops it.
     async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
         let kms = source == "fast";
         let source = match source.as_str() {

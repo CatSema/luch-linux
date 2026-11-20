@@ -267,7 +267,7 @@ static uint32_t find_plane(int fd) {
 }
 
 int luch_kms_main(int argc, char **argv) {
-    const char *card_path = getenv("LUCH_KMS_CARD") ? getenv("LUCH_KMS_CARD") : "/dev/dri/card1";
+    const char *card_path = getenv("LUCH_KMS_CARD");
     const char *render = getenv("LUCH_KMS_RENDER") ? getenv("LUCH_KMS_RENDER") : "/dev/dri/renderD128";
     int W = 1920, H = 1080, FPS = 60, KBPS = 20000, bench = 0;
     const char *codec_name = "h264_vaapi";
@@ -280,12 +280,20 @@ int luch_kms_main(int argc, char **argv) {
     }
     prctl(PR_SET_PDEATHSIG, SIGTERM); // die with luchd
 
-    int card = open(card_path, O_RDWR | O_CLOEXEC);
-    if (card < 0) DIE("open %s: %s", card_path, strerror(errno));
-    drmSetClientCap(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    drmSetClientCap(card, DRM_CLIENT_CAP_ATOMIC, 1);
-    uint32_t plane = find_plane(card);
-    if (!plane) DIE("no active plane on %s (needs CAP_SYS_ADMIN)", card_path);
+    // The card driving a display: LUCH_KMS_CARD, or the first /dev/dri/cardN with an active plane.
+    int card = -1; uint32_t plane = 0; char probe[32];
+    for (int n = 0; n < 8 && !plane; n++) {
+        if (card_path && n) break;
+        snprintf(probe, sizeof probe, "/dev/dri/card%d", n);
+        const char *path = card_path ? card_path : probe;
+        if (card >= 0) close(card);
+        if ((card = open(path, O_RDWR | O_CLOEXEC)) < 0) continue;
+        drmSetClientCap(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+        drmSetClientCap(card, DRM_CLIENT_CAP_ATOMIC, 1);
+        drmModePlaneRes *pr = drmModeGetPlaneResources(card);
+        if (pr) { drmModeFreePlaneResources(pr); plane = find_plane(card); }
+    }
+    if (!plane) DIE("no active display plane on any /dev/dri/card* (luch-kms needs CAP_SYS_ADMIN)");
 
     PlaneProps cpp = {0};
     uint32_t cursor_plane = find_cursor(card, plane, &cpp);
