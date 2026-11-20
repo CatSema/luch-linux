@@ -4,5 +4,5 @@ resolver = "2"
 
 [workspace.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "sync"] }
 luch-proto = { path = "luch-proto" }

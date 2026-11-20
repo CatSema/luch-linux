@@ -14,7 +14,7 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl list | connect <id|name> | disconnect <id|name> | watch | id";
+const USAGE: &str = "usage: luchctl [list | connect <id|name> | disconnect <id|name> | watch | id]   (no args: interactive)";
 
 fn print(rows: &[ReceiverRow]) {
     if rows.is_empty() {
@@ -62,8 +62,64 @@ async fn run(args: &[String]) -> Result<(), String> {
                 print(&p.receivers().await.map_err(e)?);
             }
         }
+        [] => tui(&p).await.map_err(e)?,
         _ => return Err(USAGE.into()),
     }
+    Ok(())
+}
+
+fn draw(rows: &[ReceiverRow], note: &str) {
+    print!("\x1b[2J\x1b[H"); // clear screen, cursor home
+    println!("Luch — receivers on the LAN\n");
+    if rows.is_empty() {
+        println!("  (searching…)");
+    }
+    for (i, (_, name, model, addr, ifname, port, connected)) in rows.iter().enumerate() {
+        let mark = if *connected { "●" } else { "○" };
+        println!("  {} {mark} {name:<24} {model:<14} {addr}:{port} ({ifname})", i + 1);
+    }
+    println!("\n  <N> connect/disconnect · r refresh · q quit");
+    if !note.is_empty() {
+        println!("  {note}");
+    }
+    print!("> ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+// ponytail: line-based screen, no raw mode; ratatui when it grows menus.
+async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let mut changes = p.receive_receivers_changed().await?;
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut rows = p.receivers().await?;
+    let mut note = String::new();
+    loop {
+        draw(&rows, &note);
+        tokio::select! {
+            _ = changes.next() => {}
+            line = input.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                let cmd = line.trim();
+                note.clear();
+                match (cmd, cmd.parse::<usize>()) {
+                    ("q", _) => break,
+                    (_, Ok(n)) if (1..=rows.len()).contains(&n) => {
+                        let (id, name, .., connected) = &rows[n - 1];
+                        let r: zbus::Result<&str> = if *connected { p.disconnect(id).await.map(|_| "disconnected") } else { p.connect(id).await.map(|_| "connected") };
+                        note = match r {
+                            Ok(s) => format!("{name}: {s}"),
+                            Err(err) => format!("{name}: {err}"),
+                        };
+                    }
+                    ("" | "r", _) => {}
+                    _ => note = format!("unknown command: {cmd}"),
+                }
+            }
+        }
+        rows = p.receivers().await?;
+    }
+    println!();
     Ok(())
 }
 
