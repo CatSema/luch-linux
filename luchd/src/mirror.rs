@@ -23,6 +23,8 @@ use gstreamer_app as gst_app;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
+const UHD: (u32, u32) = (3840, 2160);
+
 /// Frame size when nothing else is asked for.
 pub const WIDTH: u32 = 1920;
 pub const HEIGHT: u32 = 1080;
@@ -70,7 +72,9 @@ pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32)
     let max = receiver_max.and_then(parse_size);
     match env.map(str::trim) {
         None | Some("") => (WIDTH, HEIGHT),
-        Some("auto") => max.unwrap_or((WIDTH, HEIGHT)),
+        // A receiver's announced max can be more than its decoder takes (a Google TV Streamer says 4096x2304 and
+        // drops a 4096x2304@60 HEVC session), so `auto` stops at UHD.
+        Some("auto") => max.map(|(w, h)| (w.min(UHD.0), h.min(UHD.1))).unwrap_or((WIDTH, HEIGHT)),
         Some(v) => match (parse_size(v), max) {
             (Some((w, h)), Some((mw, mh))) => (w.min(mw), h.min(mh)),
             (Some(size), None) => size,
@@ -569,6 +573,7 @@ mod tests {
     #[test]
     fn session_size_auto_follows_the_receiver() {
         assert_eq!(session_size(Some("auto"), Some("3840x2160")), (3840, 2160));
+        assert_eq!(session_size(Some("auto"), Some("4096x2304")), (3840, 2160)); // announced max above UHD
         assert_eq!(session_size(Some("auto"), Some("1280x720")), (1280, 720));
         assert_eq!(session_size(Some("auto"), None), (1920, 1080));
         assert_eq!(session_size(Some("auto"), Some("0x0")), (1920, 1080));
