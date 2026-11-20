@@ -126,7 +126,9 @@ static Target targets[16]; static int n_targets;
 
 /// Imported scanout buffer, keyed by KMS framebuffer id (the compositor cycles a few of them).
 typedef struct { uint32_t fb_id; GLuint tex; EGLImage img; int fd; int w, h; } Source;
-static Source sources[8]; static int src_next;
+/// Separate caches: a new cursor buffer must never evict the primary buffer being sampled.
+typedef struct { Source s[8]; int next; } Cache;
+static Cache primary_cache, cursor_cache;
 
 static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
     VASurfaceID id = (VASurfaceID)(uintptr_t)f->data[3];
@@ -156,7 +158,8 @@ static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
     return t;
 }
 
-static Source *source_for(EGLDisplay d, int card, uint32_t fb_id, int *w, int *h) {
+static Source *source_for(Cache *cache, EGLDisplay d, int card, uint32_t fb_id, int *w, int *h) {
+    Source *sources = cache->s;
     for (int i = 0; i < 8; i++) if (sources[i].fb_id == fb_id && sources[i].tex) { *w = sources[i].w; *h = sources[i].h; return &sources[i]; }
     drmModeFB2 *fb = drmModeGetFB2(card, fb_id);
     if (!fb || !fb->handles[0]) { if (fb) drmModeFreeFB2(fb); return NULL; }
@@ -170,7 +173,7 @@ static Source *source_for(EGLDisplay d, int card, uint32_t fb_id, int *w, int *h
     }
     drmModeFreeFB2(fb);
     if (img == EGL_NO_IMAGE) { close(fd); return NULL; }
-    Source *s = &sources[src_next++ % 8];
+    Source *s = &sources[cache->next++ % 8];
     if (s->tex) { glDeleteTextures(1, &s->tex); eglDestroyImage(d, s->img); close(s->fd); }
     s->fb_id = fb_id; s->img = img; s->fd = fd; s->w = *w; s->h = *h;
     glGenTextures(1, &s->tex); glBindTexture(GL_TEXTURE_EXTERNAL_OES, s->tex);
@@ -339,10 +342,10 @@ int luch_kms_main(int argc, char **argv) {
         if (!fb_id || (fb_id == last_fb && !cur_moved && t0 - last_out < keepalive_us && !force_idr)) continue;
         last_fb = fb_id; last_cur = cur;
         int sw = 0, sh = 0;
-        Source *s = source_for(egl, card, fb_id, &sw, &sh);
+        Source *s = source_for(&primary_cache, egl, card, fb_id, &sw, &sh);
         if (!s) continue;
         int cw = 0, ch = 0;
-        Source *cs = cur.fb ? source_for(egl, card, cur.fb, &cw, &ch) : NULL;
+        Source *cs = cur.fb ? source_for(&cursor_cache, egl, card, cur.fb, &cw, &ch) : NULL;
 
         AVFrame *f = av_frame_alloc();
         ck(av_hwframe_get_buffer(pool, f, 0), "surface");
