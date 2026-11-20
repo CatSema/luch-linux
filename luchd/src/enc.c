@@ -8,8 +8,13 @@
 #include <libavutil/opt.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+
+static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static double t_map, t_send, t_recv; static int t_n;
 
 typedef struct LuchEnc {
     AVBufferRef *drm_dev, *va_dev, *drm_frames, *va_frames;
@@ -70,6 +75,9 @@ LuchEnc *luch_enc_open(const char *render_node, int w, int h, int fps, int kbps,
     c->bit_rate = c->rc_max_rate = (int64_t)kbps * 1000;
     c->rc_buffer_size = (int)((int64_t)kbps * 1000 / fps); // one-frame VBV: no frame overshoots the link
     c->color_range = AVCOL_RANGE_MPEG;
+    // Fastest driver preset (target usage 7), as ALVR uses on Intel: less motion search on the EUs.
+    const char *cl = getenv("LUCH_CL");
+    c->compression_level = cl ? atoi(cl) : 7;
     AVDictionary *o = NULL;
     av_dict_set(&o, "async_depth", "1", 0);
     av_dict_set(&o, "rc_mode", "VBR", 0);
@@ -114,12 +122,14 @@ int luch_enc_encode(LuchEnc *e, int fd, uint64_t modifier, uint32_t off0, uint32
 
     dst->format = AV_PIX_FMT_VAAPI;
     dst->hw_frames_ctx = av_buffer_ref(e->va_frames);
+    double t0 = now_ms();
     if ((r = av_hwframe_map(dst, src, AV_HWFRAME_MAP_READ)) < 0) { fail(err, errlen, "map dmabuf->vaapi", r); goto done; }
     dst->pts = pts_us;
     if (force_idr) {
         dst->pict_type = AV_PICTURE_TYPE_I;
         dst->flags |= AV_FRAME_FLAG_KEY;
     }
+    double t1 = now_ms();
     if ((r = avcodec_send_frame(e->c, dst)) < 0) { fail(err, errlen, "send_frame", r); goto done; }
     r = 0;
     while (avcodec_receive_packet(e->c, e->pkt) == 0) {
@@ -133,6 +143,11 @@ int luch_enc_encode(LuchEnc *e, int fd, uint64_t modifier, uint32_t off0, uint32
         av_packet_unref(e->pkt);
     }
     *out = e->out;
+    double t2 = now_ms();
+    if (getenv("LUCH_PROBE")) {
+        t_map += t1 - t0; t_send += t2 - t1; t_n++;
+        if (t_n == 60) { fprintf(stderr, "[probe] enc: map %.2f ms, send+receive %.2f ms\n", t_map / t_n, t_send / t_n); t_map = t_send = 0; t_n = 0; }
+    }
 done:
     av_frame_free(&dst); // unmaps the VA surface; the DMA-BUF stays owned by the caller
     av_frame_free(&src);

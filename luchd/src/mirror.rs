@@ -160,12 +160,13 @@ fn pipeline(fd: i32, node: u32) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
+    let scale = std::env::var("LUCH_SCALE").unwrap_or_else(|_| "fast".into());
     let drm = std::env::var("LUCH_DRM_FORMAT").unwrap_or_else(|_| "NV12:0x0100000000000009".into());
     // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
     let desc = format!(
         "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
            ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
-           ! vapostproc add-borders=true \
+           ! vapostproc scale-method={scale} \
            ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={WIDTH},height={HEIGHT} \
            ! appsink name=v sync=false max-buffers=1 drop=true \
          pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true buffer-time=10000 latency-time={lat} \
@@ -235,6 +236,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
     let want_idr = Arc::new(AtomicBool::new(false));
     let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
     let warned = AtomicBool::new(false);
+    let dbg = Mutex::new((0f64, 0f64, 0u32));
     let vsink = p.by_name("v").unwrap().downcast::<gst_app::AppSink>().unwrap();
     let asink = p.by_name("a").unwrap().downcast::<gst_app::AppSink>().unwrap();
 
@@ -263,6 +265,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
                     }
                 };
                 let pts_rt = sample.buffer().and_then(|b| b.pts());
+                let at_sink = timing(s, pts_rt).1;
                 let mut enc = encoder.lock().unwrap();
                 if enc.is_none() {
                     match crate::enc::Encoder::open(&render_node(), WIDTH, HEIGHT, FPS, VIDEO_KBPS) {
@@ -284,6 +287,16 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> Arc<AtomicBool> {
                 });
                 if let Err(e) = r {
                     report(e);
+                }
+                if std::env::var_os("LUCH_PROBE").is_some() {
+                    let mut a = dbg.lock().unwrap();
+                    a.0 += at_sink as f64 / 10.0;
+                    a.1 += timing(s, pts_rt).1 as f64 / 10.0;
+                    a.2 += 1;
+                    if a.2 == 60 {
+                        eprintln!("[probe] appsink entry {:.1} ms, after encode+send {:.1} ms", a.0 / 60.0, a.1 / 60.0);
+                        *a = (0.0, 0.0, 0);
+                    }
                 }
                 Ok(gst::FlowSuccess::Ok)
             })
