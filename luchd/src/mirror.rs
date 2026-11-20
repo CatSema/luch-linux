@@ -7,8 +7,8 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     os::fd::{AsRawFd, OwnedFd},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -37,6 +37,9 @@ pub const KIND_VIDEO: u8 = 1;
 pub const KIND_AUDIO: u8 = 2;
 pub const F_IDR: u8 = 1;
 pub const F_CONFIG: u8 = 2;
+
+/// Latest numbers for one mirroring session, shared with D-Bus `Stats`.
+pub type Stats = Arc<Mutex<Value>>;
 
 /// Where and what to mirror.
 pub struct Target {
@@ -73,6 +76,8 @@ struct Tx {
     kind: u8,
     seq: AtomicU32,
     warned: AtomicBool,
+    bytes: AtomicU64,
+    lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
 }
 
 /// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
@@ -87,12 +92,14 @@ impl Tx {
         s.set_tos_v4(dscp << 2)?; // CS5 video / CS6 audio -> Wi-Fi WMM video/voice queues
         s.set_send_buffer_size(1 << 20)?;
         s.connect(&to.into())?;
-        Ok(Tx { sock: s.into(), kind, seq: AtomicU32::new(0), warned: AtomicBool::new(false) })
+        Ok(Tx { sock: s.into(), kind, seq: AtomicU32::new(0), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) })
     }
 
     // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
     fn send_frame(&self, data: &[u8], flags: u8, pts_us: u64, host_lat: u16) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.lat_sum.fetch_add(host_lat as u64, Ordering::Relaxed);
         if seq == 0 {
             eprintln!("[luchd] first {} frame: {} bytes", if self.kind == KIND_VIDEO { "video" } else { "audio" }, data.len());
         }
@@ -176,7 +183,11 @@ fn pipeline(fd: i32, node: u32) -> Result<gst::Pipeline, String> {
 
 /// Microseconds of pipeline running time for `pts`, and capture->now latency in 0.1 ms.
 fn timing(sink: &gst_app::AppSink, pts: Option<gst::ClockTime>) -> (u64, u16) {
+    // GstVideoEncoder shifts output PTS by 1000 h so DTS can't go negative; undo it so video and
+    // audio share the pipeline running-time base again.
+    const ENC_OFFSET: gst::ClockTime = gst::ClockTime::from_seconds(1000 * 3600);
     let pts = pts.unwrap_or(gst::ClockTime::ZERO);
+    let pts = if pts >= ENC_OFFSET { pts - ENC_OFFSET } else { pts };
     let now = sink.current_running_time().unwrap_or(pts);
     let lat = now.saturating_sub(pts).useconds() / 100;
     (pts.useconds(), lat.min(u16::MAX as u64) as u16)
@@ -222,6 +233,10 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> gst_app::AppSink {
     vsink
 }
 
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
 fn force_idr(vsink: &gst_app::AppSink) {
     let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
     vsink.send_event(ev);
@@ -233,6 +248,7 @@ pub async fn run(
     cmd: mpsc::Sender<Cmd>,
     mut events: broadcast::Receiver<Value>,
     mut stop: mpsc::Receiver<()>,
+    stats: Stats,
 ) -> Result<&'static str, String> {
     let (_sc, session, fd, node) = portal(t.source).await?;
 
@@ -260,7 +276,7 @@ pub async fn run(
     let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
 
     let p = pipeline(fd.as_raw_fd(), node)?;
-    let vsink = wire(&p, video, audio);
+    let vsink = wire(&p, video.clone(), audio);
     if let Err(e) = p.set_state(gst::State::Playing) {
         let detail = p.bus().and_then(|b| b.timed_pop_filtered(gst::ClockTime::from_mseconds(500), &[gst::MessageType::Error]));
         let _ = p.set_state(gst::State::Null);
@@ -273,15 +289,36 @@ pub async fn run(
     eprintln!("[luchd] mirroring to {} ({}: video {vp}, audio {ap})", t.name, t.address);
 
     let mut bus = p.bus().unwrap().stream();
+    let mut second = tokio::time::interval(Duration::from_secs(1));
+    let (mut rtt, mut rx_stats) = (Value::Null, Value::Null);
+    let (mut last_frames, mut last_bytes, mut last_lat) = (0u64, 0u64, 0u64);
     let why = loop {
         tokio::select! {
+            _ = second.tick() => {
+                // Sender-side numbers, once a second: to the receiver (for its on-screen overlay) and to D-Bus.
+                let frames = video.seq.load(Ordering::Relaxed) as u64;
+                let bytes = video.bytes.load(Ordering::Relaxed);
+                let lat = video.lat_sum.load(Ordering::Relaxed);
+                let df = frames - last_frames;
+                let host_ms = if df > 0 { (lat - last_lat) as f64 / df as f64 / 10.0 } else { 0.0 };
+                let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
+                (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
+                let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
+                                    "fps": df, "mbps": round1(mbps), "encoder": "vah264enc", "res": format!("{WIDTH}x{HEIGHT}")});
+                let _ = cmd.send(Cmd::Send(sender.clone())).await;
+                // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
+                let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
+                let est = host_ms + rtt.as_f64().unwrap_or(0.0) / 2.0 + decode;
+                *stats.lock().unwrap() = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est)});
+            }
             _ = stop.recv() => {
                 let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
                 break Ok("stopped");
             }
             ev = events.recv() => match ev {
                 Ok(v) if v["t"] == "keyframe" => force_idr(&vsink),
-                Ok(v) if v["t"] == "stats" => eprintln!("[luchd] {}: stats {v}", t.name),
+                Ok(v) if v["t"] == "stats" => rx_stats = v,
+                Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => break Ok("stopped by receiver"),
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break Ok("control channel closed"),
@@ -328,7 +365,7 @@ mod tests {
     fn frame_is_sharded_and_reassembles() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let to = match rx.local_addr().unwrap() { std::net::SocketAddr::V4(a) => a, _ => unreachable!() };
-        let tx = Tx { sock: UdpSocket::bind("127.0.0.1:0").unwrap(), kind: KIND_VIDEO, seq: AtomicU32::new(7), warned: AtomicBool::new(false) };
+        let tx = Tx { sock: UdpSocket::bind("127.0.0.1:0").unwrap(), kind: KIND_VIDEO, seq: AtomicU32::new(7), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) };
         tx.sock.connect(to).unwrap();
         let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
         tx.send_frame(&frame, F_IDR, 1234, 5);

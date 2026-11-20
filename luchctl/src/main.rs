@@ -10,13 +10,14 @@ trait Luch1 {
     fn disconnect(&self, id: &str) -> zbus::Result<()>;
     fn mirror(&self, id: &str, source: &str) -> zbus::Result<()>;
     fn stop_mirror(&self, id: &str) -> zbus::Result<()>;
+    fn stats(&self, id: &str) -> zbus::Result<String>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [monitor|window|virtual] | stop <r> | watch | id]
+const USAGE: &str = "usage: luchctl [list | connect <r> | disconnect <r> | mirror <r> [monitor|window|virtual] | stop <r> | stats <r> | watch | id]
        <r> = receiver id or name; no arguments: interactive";
 
 fn print(rows: &[ReceiverRow]) {
@@ -59,6 +60,13 @@ async fn run(args: &[String]) -> Result<(), String> {
         ["disconnect", key] => p.disconnect(&find_id(&p, key).await?).await.map_err(e)?,
         ["mirror", key] => p.mirror(&find_id(&p, key).await?, "monitor").await.map_err(e)?,
         ["mirror", key, source] => p.mirror(&find_id(&p, key).await?, source).await.map_err(e)?,
+        ["stats", key] => {
+            let id = find_id(&p, key).await?;
+            loop {
+                println!("{}", stats_line(&p.stats(&id).await.map_err(e)?));
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
         ["stop", key] => p.stop_mirror(&find_id(&p, key).await?).await.map_err(e)?,
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
@@ -74,7 +82,22 @@ async fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn draw(rows: &[ReceiverRow], note: &str) {
+/// One human line from the daemon's Stats JSON.
+fn stats_line(json: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let (s, r) = (&v["sender"], &v["receiver"]);
+    if s.is_null() {
+        return "(not mirroring)".into();
+    }
+    let n = |x: &serde_json::Value| x.as_f64().map(|f| format!("{f}")).unwrap_or("–".into());
+    format!(
+        "≈{} ms total | rtt {} ms · host {} ms · decode {} ms | send {} fps {} Mbit/s · shown {} fps · lost {} dropped {}",
+        n(&v["est_ms"]), n(&s["rtt_ms"]), n(&s["host_ms"]), n(&r["decode_ms"]),
+        n(&s["fps"]), n(&s["mbps"]), n(&r["fps"]), n(&r["lost"]), n(&r["dropped"])
+    )
+}
+
+fn draw(rows: &[ReceiverRow], stats: &[(usize, String)], note: &str) {
     print!("\x1b[2J\x1b[H"); // clear screen, cursor home
     println!("Luch — receivers on the LAN\n");
     if rows.is_empty() {
@@ -83,6 +106,9 @@ fn draw(rows: &[ReceiverRow], note: &str) {
     for (i, (_, name, model, addr, ifname, port, connected, mirroring)) in rows.iter().enumerate() {
         let mark = if *mirroring { "▶" } else if *connected { "●" } else { "○" };
         println!("  {} {mark} {name:<24} {model:<14} {addr}:{port} ({ifname})", i + 1);
+        if let Some((_, line)) = stats.iter().find(|(j, _)| *j == i) {
+            println!("      {line}");
+        }
     }
     println!("\n  <N> connect/disconnect · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · q quit");
     if !note.is_empty() {
@@ -100,10 +126,16 @@ async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
     let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut rows = p.receivers().await?;
     let mut note = String::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
-        draw(&rows, &note);
+        let mut stats = Vec::new();
+        for (i, r) in rows.iter().enumerate().filter(|(_, r)| r.7) {
+            stats.push((i, stats_line(&p.stats(&r.0).await?)));
+        }
+        draw(&rows, &stats, &note);
         tokio::select! {
             _ = changes.next() => {}
+            _ = tick.tick() => {}
             line = input.next_line() => {
                 let Ok(Some(line)) = line else { break };
                 let cmd = line.trim();

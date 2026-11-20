@@ -24,7 +24,7 @@ const AVAHI: &str = "org.freedesktop.Avahi";
 const AVAHI_SERVER: &str = "org.freedesktop.Avahi.Server";
 const AVAHI_IF_UNSPEC: i32 = -1;
 const AVAHI_PROTO_INET: i32 = 0;
-const PING_EVERY: Duration = Duration::from_secs(10);
+const PING_EVERY: Duration = Duration::from_secs(1); // also the RTT sample rate
 const DEAD_AFTER: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -52,6 +52,7 @@ struct State {
     found: HashMap<String, Receiver>,
     conns: HashMap<String, Conn>,
     mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
+    stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -129,19 +130,34 @@ impl Luch {
         let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
         let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source };
         let (stop_tx, stop_rx) = mpsc::channel(1);
-        self.st.lock().await.mirrors.insert(id.clone(), stop_tx);
+        let stats = mirror::Stats::default();
+        {
+            let mut st = self.st.lock().await;
+            st.mirrors.insert(id.clone(), stop_tx);
+            st.stats.insert(id.clone(), stats.clone());
+        }
         changed(conn).await;
         let (st, conn) = (self.st.clone(), conn.clone());
         tokio::spawn(async move {
-            let res = mirror::run(target, c.cmd, c.events.subscribe(), stop_rx).await;
+            let res = mirror::run(target, c.cmd, c.events.subscribe(), stop_rx, stats).await;
             match res {
                 Ok(why) => eprintln!("[luchd] {}: mirroring ended ({why})", r.name),
                 Err(e) => eprintln!("[luchd] {}: mirroring failed: {e}", r.name),
             }
-            st.lock().await.mirrors.remove(&id);
+            {
+                let mut s = st.lock().await;
+                s.mirrors.remove(&id);
+                s.stats.remove(&id);
+            }
             changed(&conn).await;
         });
         Ok(())
+    }
+
+    /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.
+    async fn stats(&self, id: String) -> String {
+        let s = self.st.lock().await.stats.get(&id).cloned();
+        s.map(|s| s.lock().unwrap().to_string()).unwrap_or_else(|| "{}".into())
     }
 
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
@@ -244,6 +260,7 @@ async fn run_channel(
 
     let mut last_rx = Instant::now();
     let mut n: u64 = 0;
+    let mut ping_sent = Instant::now();
     let mut tick = tokio::time::interval(PING_EVERY);
     tick.tick().await;
     let why = loop {
@@ -264,6 +281,7 @@ async fn run_channel(
                     break "silent for 30 s";
                 }
                 n += 1;
+                ping_sent = Instant::now();
                 if send(&mut wr, &json!({"t": "ping", "n": n})).await.is_err() {
                     break "write failed";
                 }
@@ -272,6 +290,11 @@ async fn run_channel(
                 let Some(v) = m else { break "closed by receiver" };
                 last_rx = Instant::now();
                 match v["t"].as_str().unwrap_or("") {
+                    "pong" if v["n"] == n => {
+                        // Internal event for the mirror task; never sent on the wire.
+                        let rtt = ping_sent.elapsed().as_secs_f64() * 1000.0;
+                        let _ = events.send(json!({"t": "_rtt", "ms": rtt}));
+                    }
                     "pong" | "welcome" => {}
                     "ping" => {
                         if send(&mut wr, &json!({"t": "pong", "n": v["n"]})).await.is_err() {
