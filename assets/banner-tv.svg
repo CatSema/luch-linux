@@ -15,7 +15,6 @@
   <path d="M146,92h220a10,10 0,0 1,10 10v101a10,10 0,0 1,-10 10h-220a10,10 0,0 1,-10 -10v-101a10,10 0,0 1,10 -10z" fill="#FFF6DC" fill-opacity="0.32"/>
   <path d="M193,330h126a9,9 0,0 1,9 9v76a9,9 0,0 1,-9 9h-126a9,9 0,0 1,-9 -9v-76a9,9 0,0 1,9 -9z" fill="#E9EDF8"/>
   <path d="M194,337h124a3,3 0,0 1,3 3v75a3,3 0,0 1,-3 3h-124a3,3 0,0 1,-3 -3v-75a3,3 0,0 1,3 -3z" fill="url(#screen)"/>
-  <path d="M250,337h12a2,2 0,0 1,2 2v0a2,2 0,0 1,-2 2h-12a2,2 0,0 1,-2 -2v-0a2,2 0,0 1,2 -2z" fill="#1A2340"/>
   <path d="M166 424 H346 V430 Q346 438 338 438 H174 Q166 438 166 430 Z" fill="#E9EDF8"/>
   <path d="M238,424h36a2,2 0,0 1,2 2v0a2,2 0,0 1,-2 2h-36a2,2 0,0 1,-2 -2v-0a2,2 0,0 1,2 -2z" fill="#B9C0D6"/>
 </g><text x="344.8" y="176.5" font-family="Adwaita Sans, Cantarell, sans-serif" font-weight="700" font-size="70" fill="#FFF3D6">Луч</text><text x="344.8" y="221.6" font-family="Adwaita Sans, Cantarell, sans-serif" font-size="26" fill="#FFC27A">Luch · screen mirroring</text></svg>

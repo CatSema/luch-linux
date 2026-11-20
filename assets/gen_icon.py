@@ -14,10 +14,9 @@ import random
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCREEN = (120, 76, 272, 153, 18)   # x, y, w, h, r  (16:9)
 INNER = (136, 92, 240, 121, 10)
-# MacBook-like front view: thin-bezel 16:10 lid, a thin base a bit wider, a scoop in the middle.
+# MacBook-like front view (no notch): thin-bezel 16:10 lid, a thin base a bit wider, a scoop in the middle.
 LID = (184, 330, 144, 94, 9)
 LID_GLASS = (191, 337, 130, 81, 3)
-NOTCH = (248, 337, 16, 4, 2)
 BASE = "M166 424 H346 V430 Q346 438 338 438 H174 Q166 438 166 430 Z"
 SCOOP = (236, 424, 40, 4, 2)
 # The beam leaves the whole laptop display and lands on the whole big screen.
@@ -87,7 +86,6 @@ def svg_colour(rays, dust):
   <path d="{rrect(*INNER)}" fill="#FFF6DC" fill-opacity="0.32"/>
   <path d="{rrect(*LID)}" fill="#E9EDF8"/>
   <path d="{rrect(*LID_GLASS)}" fill="url(#screen)"/>
-  <path d="{rrect(*NOTCH)}" fill="#1A2340"/>
   <path d="{BASE}" fill="#E9EDF8"/>
   <path d="{rrect(*SCOOP)}" fill="#B9C0D6"/>
 </svg>
@@ -126,7 +124,6 @@ def android_foreground(rays, dust):
     p.append(f'<path android:fillColor="#52FFF6DC" android:pathData="{rrect(*INNER)}" />')
     p.append(f'<path android:fillColor="#FFE9EDF8" android:pathData="{rrect(*LID)}" />')
     p.append(f'<path android:pathData="{rrect(*LID_GLASS)}">{grad_linear(191, 337, 321, 418, [(0, "#FFFFE7A6"), (1, "#FFFF8F3A")])}</path>')
-    p.append(f'<path android:fillColor="#FF1A2340" android:pathData="{rrect(*NOTCH)}" />')
     p.append(f'<path android:fillColor="#FFE9EDF8" android:pathData="{BASE_A}" />')
     p.append(f'<path android:fillColor="#FFB9C0D6" android:pathData="{rrect(*SCOOP)}" />')
     return vector(108, 108, "\n        ".join(p), group=True, aapt=True)

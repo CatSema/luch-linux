@@ -38,7 +38,6 @@
         <path android:fillColor="#52FFF6DC" android:pathData="M146,92h220a10,10 0,0 1,10 10v101a10,10 0,0 1,-10 10h-220a10,10 0,0 1,-10 -10v-101a10,10 0,0 1,10 -10z" />
         <path android:fillColor="#FFE9EDF8" android:pathData="M193,330h126a9,9 0,0 1,9 9v76a9,9 0,0 1,-9 9h-126a9,9 0,0 1,-9 -9v-76a9,9 0,0 1,9 -9z" />
         <path android:pathData="M194,337h124a3,3 0,0 1,3 3v75a3,3 0,0 1,-3 3h-124a3,3 0,0 1,-3 -3v-75a3,3 0,0 1,3 -3z"><aapt:attr name="android:fillColor"><gradient android:type="linear" android:startX="191" android:startY="337" android:endX="321" android:endY="418"><item android:offset="0" android:color="#FFFFE7A6" /><item android:offset="1" android:color="#FFFF8F3A" /></gradient></aapt:attr></path>
-        <path android:fillColor="#FF1A2340" android:pathData="M250,337h12a2,2 0,0 1,2 2v0a2,2 0,0 1,-2 2h-12a2,2 0,0 1,-2 -2v-0a2,2 0,0 1,2 -2z" />
         <path android:fillColor="#FFE9EDF8" android:pathData="M166,424H346V430Q346,438 338,438H174Q166,438 166,430Z" />
         <path android:fillColor="#FFB9C0D6" android:pathData="M238,424h36a2,2 0,0 1,2 2v0a2,2 0,0 1,-2 2h-36a2,2 0,0 1,-2 -2v-0a2,2 0,0 1,2 -2z" />
     </group>
