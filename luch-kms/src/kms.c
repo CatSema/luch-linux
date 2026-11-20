@@ -27,6 +27,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,13 +104,20 @@ static GLuint program(const char *frag) {
 
 // BT.709 limited range. The scanout texture is sampled as external (any modifier/format).
 #define FRAG_HEAD "#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\nprecision highp float;\n" \
-                  "uniform samplerExternalOES src; uniform samplerExternalOES cur; uniform vec4 crect; uniform bool has_cur;\n" \
+                  "uniform samplerExternalOES src; uniform samplerExternalOES cur; uniform vec4 crect; uniform bool has_cur; uniform int taps;\n" \
                   "in vec2 uv; out vec4 o;\n" \
-                  "vec3 px() { vec3 c = texture(src, uv).rgb;\n" \
-                  "  if (has_cur) { vec2 q = (uv - crect.xy) / crect.zw;\n" \
+                  "vec3 px_at(vec2 p) { vec3 c = texture(src, p).rgb;\n" \
+                  "  if (has_cur) { vec2 q = (p - crect.xy) / crect.zw;\n" \
                   "    if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThan(q, vec2(1.0)))) {\n" \
                   "      vec4 k = texture(cur, q); c = k.rgb + c * (1.0 - k.a); } }\n" \
-                  "  return c; }\n"
+                  "  return c; }\n" \
+                  /* One bilinear tap per output pixel reads only 2x2 source texels: downscaling by more than ~1.3x then skips   */ \
+                  /* texels unevenly and thin strokes (text) double or shimmer. Average taps x taps samples over the footprint. */ \
+                  "vec3 px() { if (taps <= 1) return px_at(uv);\n" \
+                  "  vec2 dx = dFdx(uv), dy = dFdy(uv); vec3 sum = vec3(0.0); float n = float(taps);\n" \
+                  "  for (int i = 0; i < taps; i++) for (int j = 0; j < taps; j++)\n" \
+                  "    sum += px_at(uv + ((float(i) + 0.5) / n - 0.5) * dx + ((float(j) + 0.5) / n - 0.5) * dy);\n" \
+                  "  return sum / (n * n); }\n"
 static const char *FRAG_Y = FRAG_HEAD
     "void main() { vec3 c = px();\n"
     "  o = vec4(dot(c, vec3(0.2126, 0.7152, 0.0722)) * (219.0/255.0) + 16.0/255.0, 0.0, 0.0, 1.0); }\n";
@@ -122,7 +130,7 @@ static const char *FRAG_UV = FRAG_HEAD
 // ---------- caches ----------
 
 /// One NV12 VA surface from the encoder pool, with its two planes bound as GL render targets.
-typedef struct { VASurfaceID id; GLuint fbo[2]; } Target;
+typedef struct { VASurfaceID id; GLuint fbo[2]; int geo[4]; } Target; // geo: picture rectangle drawn last (x, y, w, h)
 static Target targets[16]; static int n_targets;
 
 /// Imported scanout buffer, keyed by KMS framebuffer id (the compositor cycles a few of them).
@@ -266,6 +274,8 @@ static uint32_t find_plane(int fd) {
     return best;
 }
 
+enum { SCALE_FIT, SCALE_FILL, SCALE_STRETCH };
+
 int luch_kms_main(int argc, char **argv) {
     const char *card_path = getenv("LUCH_KMS_CARD");
     const char *render = getenv("LUCH_KMS_RENDER") ? getenv("LUCH_KMS_RENDER") : "/dev/dri/renderD128";
@@ -279,6 +289,8 @@ int luch_kms_main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--codec") && i + 1 < argc) { i++; codec_name = !strcmp(argv[i], "hevc") ? "hevc_vaapi" : "h264_vaapi"; }
     }
     prctl(PR_SET_PDEATHSIG, SIGTERM); // die with luchd
+    const char *scale_env = getenv("LUCH_SCALE");
+    int scale_mode = !scale_env ? SCALE_FIT : !strcmp(scale_env, "fill") ? SCALE_FILL : !strcmp(scale_env, "stretch") ? SCALE_STRETCH : SCALE_FIT;
 
     // The card driving a display: LUCH_KMS_CARD, or the first /dev/dri/cardN with an active plane.
     int card = -1; uint32_t plane = 0; char probe[32];
@@ -331,7 +343,8 @@ int luch_kms_main(int argc, char **argv) {
     av_dict_set(&o, "idr_interval", "2147483647", 0); av_dict_set(&o, "sei", "0", 0);
     ck(avcodec_open2(c, codec, &o), codec_name);
     av_dict_free(&o);
-    fprintf(stderr, "luch-kms: plane %u -> %dx%d %s %d kbps (EGL convert, VA encode)\n", plane, W, H, codec_name, KBPS);
+    fprintf(stderr, "luch-kms: plane %u -> %dx%d %s %d kbps, scale %s (EGL convert, VA encode)\n", plane, W, H, codec_name, KBPS,
+            scale_mode == SCALE_FILL ? "fill" : scale_mode == SCALE_STRETCH ? "stretch" : "fit");
 
     AVPacket *pkt = av_packet_alloc();
     uint32_t last_fb = 0;
@@ -380,9 +393,26 @@ int luch_kms_main(int argc, char **argv) {
             glUniform1i(glGetUniformLocation(progs[i], "has_cur"), cs != NULL);
             glUniform4fv(glGetUniformLocation(progs[i], "crect"), 1, rect);
         }
-        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[0]); glViewport(0, 0, W, H);
+        // Scale the source into the encoded frame. LUCH_SCALE: "fit" (default) keeps the aspect ratio and adds black bars
+        // (a 21:9 screen on a 16:9 receiver); "fill" keeps it and crops the overflow; "stretch" fills the frame, distorted.
+        // Even offsets and sizes keep the chroma plane aligned.
+        float fit = scale_mode == SCALE_FILL ? fmaxf((float)W / sw, (float)H / sh) : fminf((float)W / sw, (float)H / sh);
+        int dw = scale_mode == SCALE_STRETCH ? W : (int)(sw * fit + 0.5f) & ~1;
+        int dh = scale_mode == SCALE_STRETCH ? H : (int)(sh * fit + 0.5f) & ~1;
+        if (scale_mode == SCALE_FIT) { if (dw > W) dw = W; if (dh > H) dh = H; }
+        int ox = ((W - dw) / 2) & ~1, oy = ((H - dh) / 2) & ~1;
+        double ratio = fmax((double)sw / dw, (double)sh / dh);
+        int taps = ratio <= 1.2 ? 1 : ratio <= 2.4 ? 2 : 3;
+        for (int i = 0; i < 2; i++) { glUseProgram(progs[i]); glUniform1i(glGetUniformLocation(progs[i], "taps"), taps); }
+        int geo[4] = { ox, oy, dw, dh };
+        if (memcmp(t->geo, geo, sizeof geo) != 0) { // bars are black (limited range: Y 16, U and V 128); redraw them only on a change
+            glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[0]); glClearColor(16.0f / 255, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+            glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[1]); glClearColor(128.0f / 255, 128.0f / 255, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+            memcpy(t->geo, geo, sizeof geo);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[0]); glViewport(ox, oy, dw, dh);
         glUseProgram(prog_y); glDrawArrays(GL_TRIANGLES, 0, 3);
-        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[1]); glViewport(0, 0, W / 2, H / 2);
+        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo[1]); glViewport(ox / 2, oy / 2, dw / 2, dh / 2);
         glUseProgram(prog_uv); glDrawArrays(GL_TRIANGLES, 0, 3);
         glFinish(); // ponytail: CPU wait for the GPU; an EGL native fence would let VA wait on the GPU instead
         int64_t t2 = mono_us();
