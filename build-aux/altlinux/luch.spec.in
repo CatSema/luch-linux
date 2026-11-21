@@ -13,7 +13,7 @@ BuildRequires: gstreamer1.0-devel gst-plugins1.0-devel
 
 Requires: avahi-daemon
 Requires: gst-plugins-base1.0 gst-plugins-good1.0 gst-plugins-bad1.0
-Requires: pipewire-pulse
+Requires: pipewire
 
 %description
 Luch mirrors a Linux screen to an Android TV or a projector with game-streaming
