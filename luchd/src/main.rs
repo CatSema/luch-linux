@@ -137,8 +137,14 @@ impl Luch {
         };
         let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
         let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-        let prefer = self.st.lock().await.welcomes.get(&id).and_then(|w| w["bench"]["prefer"].as_str()).unwrap_or("video/avc").to_string();
-        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer };
+        let (prefer, max) = {
+            let st = self.st.lock().await;
+            let w = st.welcomes.get(&id);
+            (w.and_then(|w| w["bench"]["prefer"].as_str()).unwrap_or("video/avc").to_string(),
+             w.and_then(|w| w["max"].as_str()).map(str::to_string))
+        };
+        let (width, height) = mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), max.as_deref());
+        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, width, height };
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let stats = mirror::Stats::default();
         {

@@ -23,6 +23,9 @@ use gstreamer_app as gst_app;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
+const UHD: (u32, u32) = (3840, 2160);
+
+/// Frame size when nothing else is asked for.
 pub const WIDTH: u32 = 1920;
 pub const HEIGHT: u32 = 1080;
 pub const FPS: u32 = 60;
@@ -51,6 +54,33 @@ pub struct Target {
     pub kms: bool,
     /// Receiver's preferred decoder from its welcome bench ("video/hevc" or "video/avc").
     pub prefer: String,
+    /// Encoded frame size of this session, see `session_size`.
+    pub width: u32,
+    pub height: u32,
+}
+
+fn parse_size(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    // even sizes (4:2:0 chroma), within what encoders and receivers take
+    (w >= 64 && h >= 64 && w <= 8192 && h <= 8192).then_some((w & !1, h & !1))
+}
+
+/// Frame size of a session. `LUCH_SIZE` unset: 1920x1080 as before. `auto`: what the receiver announced
+/// as `max` in its welcome (e.g. a 4K TV). `WxH`: that size, never larger than the receiver's `max`.
+pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32) {
+    let max = receiver_max.and_then(parse_size);
+    match env.map(str::trim) {
+        None | Some("") => (WIDTH, HEIGHT),
+        // A receiver's announced max can be more than its decoder takes (a Google TV Streamer says 4096x2304 and
+        // drops a 4096x2304@60 HEVC session), so `auto` stops at UHD.
+        Some("auto") => max.map(|(w, h)| (w.min(UHD.0), h.min(UHD.1))).unwrap_or((WIDTH, HEIGHT)),
+        Some(v) => match (parse_size(v), max) {
+            (Some((w, h)), Some((mw, mh))) => (w.min(mw), h.min(mh)),
+            (Some(size), None) => size,
+            _ => (WIDTH, HEIGHT),
+        },
+    }
 }
 
 /// Messages to the control-channel task.
@@ -161,7 +191,7 @@ async fn portal(source: SourceType) -> Result<(Screencast, ashpd::desktop::Sessi
 }
 
 /// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
-fn pipeline(portal: Option<(i32, u32)>) -> Result<gst::Pipeline, String> {
+fn pipeline(portal: Option<(i32, u32)>, width: u32, height: u32) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
@@ -172,7 +202,7 @@ fn pipeline(portal: Option<(i32, u32)>) -> Result<gst::Pipeline, String> {
         "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
            ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
            ! vapostproc scale-method={scale} \
-           ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={WIDTH},height={HEIGHT} \
+           ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={width},height={height} \
            ! appsink name=v sync=false max-buffers=1 drop=true "
     )).unwrap_or_default();
     let desc = format!(
@@ -240,7 +270,7 @@ fn render_node() -> String {
 /// Hooks both appsinks to the UDP senders; returns the "force an IDR" flag.
 /// Hooks the appsinks to the UDP senders; returns the "force an IDR" flag and the "resend OpusHead"
 /// flag (set on every video IDR). Without a "v" sink only audio is wired.
-fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>, size: (u32, u32)) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     let need_head = Arc::new(AtomicBool::new(true));
     let want_idr = Arc::new(AtomicBool::new(false));
     let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
@@ -278,7 +308,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, 
                 let at_sink = timing(s, pts_rt).1;
                 let mut enc = encoder.lock().unwrap();
                 if enc.is_none() {
-                    match crate::enc::Encoder::open(&render_node(), WIDTH, HEIGHT, FPS, VIDEO_KBPS) {
+                    match crate::enc::Encoder::open(&render_node(), size.0, size.1, FPS, VIDEO_KBPS) {
                         Ok(e) => *enc = Some(e),
                         Err(e) => {
                             report(e);
@@ -333,13 +363,13 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, 
 
 /// Lowest-latency video: spawns luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) and forwards its
 /// packets as they come. Returns the child; write b"k" to its stdin to force an IDR.
-fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool) -> Result<std::process::Child, String> {
+fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: (u32, u32)) -> Result<std::process::Child, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
     let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
     let mut child = Command::new(&exe)
-        .args(["--size", &format!("{WIDTH}x{HEIGHT}"), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
+        .args(["--size", &format!("{}x{}", size.0, size.1), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
         .args(["--codec", if hevc { "hevc" } else { "h264" }])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -424,7 +454,7 @@ pub async fn run(
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
     let start = json!({"t": "start", "mode": "mirror",
-        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": WIDTH, "height": HEIGHT, "fps": FPS},
+        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": t.width, "height": t.height, "fps": FPS},
         "audio": {"codec": "audio/opus", "rate": 48000, "channels": 2, "frame_ms": AUDIO_FRAME_MS}});
     cmd.send(Cmd::Send(start)).await.map_err(|_| "control channel closed")?;
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -446,9 +476,9 @@ pub async fn run(
     let video = Arc::new(Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40).map_err(io)?);
     let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
 
-    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)))?;
-    let (want_idr, need_head) = wire(&p, video.clone(), audio);
-    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc)?) } else { None };
+    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)), t.width, t.height)?;
+    let (want_idr, need_head) = wire(&p, video.clone(), audio, (t.width, t.height));
+    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc, (t.width, t.height))?) } else { None };
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -479,7 +509,7 @@ pub async fn run(
                 let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
                 (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
-                                    "fps": df, "mbps": round1(mbps), "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{WIDTH}x{HEIGHT}")});
+                                    "fps": df, "mbps": round1(mbps), "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{}x{}", t.width, t.height)});
                 let _ = cmd.send(Cmd::Send(sender.clone())).await;
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
@@ -532,6 +562,30 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_size_defaults_to_full_hd() {
+        assert_eq!(session_size(None, Some("3840x2160")), (1920, 1080));
+        assert_eq!(session_size(Some(""), None), (1920, 1080));
+        assert_eq!(session_size(Some("nonsense"), Some("3840x2160")), (1920, 1080));
+    }
+
+    #[test]
+    fn session_size_auto_follows_the_receiver() {
+        assert_eq!(session_size(Some("auto"), Some("3840x2160")), (3840, 2160));
+        assert_eq!(session_size(Some("auto"), Some("4096x2304")), (3840, 2160)); // announced max above UHD
+        assert_eq!(session_size(Some("auto"), Some("1280x720")), (1280, 720));
+        assert_eq!(session_size(Some("auto"), None), (1920, 1080));
+        assert_eq!(session_size(Some("auto"), Some("0x0")), (1920, 1080));
+    }
+
+    #[test]
+    fn session_size_explicit_is_capped_by_the_receiver_and_even() {
+        assert_eq!(session_size(Some("2560x1440"), Some("3840x2160")), (2560, 1440));
+        assert_eq!(session_size(Some("3840x2160"), Some("1920x1080")), (1920, 1080));
+        assert_eq!(session_size(Some("2561x1441"), None), (2560, 1440));
+        assert_eq!(session_size(Some("99999x1080"), None), (1920, 1080));
+    }
 
     #[test]
     fn header_layout() {
