@@ -90,6 +90,137 @@ pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32)
     }
 }
 
+static LOCAL_AUDIO: AtomicBool = AtomicBool::new(true);
+
+/// Whether the sender keeps playing the sound itself while mirroring (default yes).
+pub fn local_audio() -> bool {
+    LOCAL_AUDIO.load(Ordering::Relaxed)
+}
+
+pub fn set_local_audio(on: bool) {
+    LOCAL_AUDIO.store(on, Ordering::Relaxed);
+    if let Ok(d) = crate::config_dir() {
+        let _ = std::fs::write(d.join("local-audio"), if on { "1" } else { "0" });
+    }
+}
+
+fn pactl(args: &[&str]) -> Option<String> {
+    let o = std::process::Command::new("pactl").args(args).output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Index of the sink called `name` (first column of `pactl list short sinks`).
+fn sink_index(name: &str) -> Option<String> {
+    pactl(&["list", "short", "sinks"])?.lines().find_map(|l| {
+        let mut c = l.split('\t');
+        let (idx, n) = (c.next()?, c.next()?);
+        (n == name).then(|| idx.to_string())
+    })
+}
+
+/// Ids of the playback streams currently on sink `idx`.
+fn inputs_on(idx: &str) -> Vec<String> {
+    pactl(&["list", "short", "sink-inputs"]).unwrap_or_default().lines().filter_map(|l| {
+        let mut c = l.split('\t');
+        let (id, sink) = (c.next()?, c.next()?);
+        (sink == idx).then(|| id.to_string())
+    }).collect()
+}
+
+const CAST_SINK: &str = "luch_cast";
+
+/// Undo `LocalMute`: default sink and streams back where they were, the null sink unloaded.
+fn restore_audio_state(prev: &str, module: &str) {
+    if let Some(cast) = sink_index(CAST_SINK) {
+        if sink_index(prev).is_some() {
+            for id in inputs_on(&cast) {
+                let _ = pactl(&["move-sink-input", &id, prev]);
+            }
+        }
+    }
+    if sink_index(prev).is_some() {
+        let _ = pactl(&["set-default-sink", prev]);
+    }
+    let _ = pactl(&["unload-module", module]);
+}
+
+/// While a session runs the sender's own sound goes to a null sink, which `luchd` records, so the
+/// receiver plays it and the sender stays silent (no echo with the receiver, no Bluetooth delay).
+struct LocalMute {
+    prev: String,
+    module: String,
+}
+
+impl LocalMute {
+    fn new() -> Option<Self> {
+        let prev = pactl(&["get-default-sink"])?;
+        let module = pactl(&["load-module", "module-null-sink", &format!("sink_name={CAST_SINK}"), "sink_properties=device.description=Luch"])?;
+        let mute = LocalMute { prev: prev.clone(), module: module.clone() };
+        if let Some(d) = crate::config_dir().ok() {
+            let _ = std::fs::write(d.join("restore-audio"), format!("{prev} {module}"));
+        }
+        let (Some(old), Some(_)) = (sink_index(&prev), sink_index(CAST_SINK)) else { return Some(mute) };
+        let moving = inputs_on(&old);
+        let _ = pactl(&["set-default-sink", CAST_SINK]);
+        for id in moving {
+            let _ = pactl(&["move-sink-input", &id, CAST_SINK]);
+        }
+        Some(mute)
+    }
+}
+
+impl Drop for LocalMute {
+    fn drop(&mut self) {
+        restore_audio_state(&self.prev, &self.module);
+        if let Ok(d) = crate::config_dir() {
+            let _ = std::fs::remove_file(d.join("restore-audio"));
+        }
+    }
+}
+
+static MUTE: std::sync::Mutex<Option<LocalMute>> = std::sync::Mutex::new(None);
+
+/// Make the sender's sound match the setting: silent while a session runs and LocalAudio is off.
+/// Called when a session starts or ends and when the setting changes. One shared mute, so with
+/// several sessions at once the sender is silent as long as any of them runs.
+pub fn sync_mute(session_active: bool) {
+    let mut m = MUTE.lock().unwrap();
+    if session_active && !local_audio() {
+        if m.is_none() {
+            *m = LocalMute::new();
+        }
+    } else {
+        *m = None;
+    }
+}
+
+/// Held by a running session.
+struct MuteSession;
+
+impl MuteSession {
+    fn start() -> Self {
+        sync_mute(true);
+        MuteSession
+    }
+}
+
+impl Drop for MuteSession {
+    fn drop(&mut self) {
+        sync_mute(false);
+    }
+}
+
+/// At start: read the saved setting, and undo a mute a crash left behind.
+pub fn restore_audio() {
+    let Ok(d) = crate::config_dir() else { return };
+    LOCAL_AUDIO.store(std::fs::read_to_string(d.join("local-audio")).map(|t| t.trim() != "0").unwrap_or(true), Ordering::Relaxed);
+    let f = d.join("restore-audio");
+    if let Some((prev, module)) = std::fs::read_to_string(&f).ok().and_then(|t| t.trim().split_once(' ').map(|(a, b)| (a.to_string(), b.to_string()))) {
+        restore_audio_state(&prev, &module);
+    }
+    let _ = std::fs::remove_file(f);
+}
+
 /// Capture sources this machine can actually use, best first.
 pub fn available_sources() -> Vec<&'static str> {
     let on_path = |name: &str| {
@@ -474,6 +605,7 @@ pub async fn run(
     mut stop: mpsc::Receiver<()>,
     stats: Stats,
 ) -> Result<&'static str, String> {
+    let _mute = MuteSession::start();
     let portal = if t.kms { None } else { Some(portal(t.source).await?) };
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.

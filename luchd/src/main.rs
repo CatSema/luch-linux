@@ -210,6 +210,20 @@ impl Luch {
         Ok(())
     }
 
+    /// Whether the sender keeps playing sound itself while mirroring. Off: its sound goes to the
+    /// receiver only (a null sink is the default output for the session). Saved across restarts.
+    #[zbus(property)]
+    async fn local_audio(&self) -> bool {
+        mirror::local_audio()
+    }
+
+    #[zbus(property)]
+    async fn set_local_audio(&self, on: bool) {
+        mirror::set_local_audio(on);
+        let active = !self.st.lock().await.mirrors.is_empty();
+        mirror::sync_mute(active);
+    }
+
     #[zbus(property)]
     async fn sender_id(&self) -> String {
         self.sender_id.clone()
@@ -548,6 +562,7 @@ fn short_host() -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     gstreamer::init()?;
+    mirror::restore_audio();
     let id = sender_id()?;
     let host = short_host();
     let st = Shared::default();

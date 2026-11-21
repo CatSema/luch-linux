@@ -115,6 +115,14 @@ Call `Receivers()` again to get the new state.
 
 ## Properties
 
+### `LocalAudio` (`b`, read/write, default `true`)
+
+Whether the sender keeps playing sound itself while mirroring. Set to `false`: while a session runs, the
+sender's sound goes to a null sink (`luch_cast`), `luchd` records its monitor, the receiver plays it and the
+sender stays silent (no echo with the receiver, no Bluetooth delay or A2DP artefacts). The default sink and the
+streams that were on it are put back when the session ends, and after a crash on the next `luchd` start. It
+applies at once to a running session. Saved in `~/.config/luch/local-audio`. Needs `pactl`; without it nothing changes.
+
 ### `SenderId` (`s`, read)
 
 This machine's id (UUID kept in `~/.config/luch/id`). It is also announced as `_luchsrc._tcp`, so
