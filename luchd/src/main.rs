@@ -118,6 +118,17 @@ impl Luch {
     /// screencast portal: its picker is shown the first time, later runs reuse a saved token.
     /// Returns once the session is set up; it then runs until StopMirror or the receiver stops it.
     async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        self.mirror_sized(id, source, 0, 0, conn).await
+    }
+
+    /// Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x4320); 0x0 means
+    /// "as `Mirror`" (`LUCH_SIZE`, else 1920x1080). The sizes a receiver shows are in the `welcome`
+    /// returned by `Connect` (`hw.display.modes`, `hw.video`).
+    async fn mirror_sized(&self, id: String, source: String, width: u32, height: u32, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        let explicit = (width, height) != (0, 0);
+        if explicit && (!(320..=7680).contains(&width) || !(240..=4320).contains(&height) || width % 2 != 0 || height % 2 != 0) {
+            return Err(fdo::Error::InvalidArgs(format!("bad size {width}x{height}")));
+        }
         let kms = source == "fast";
         let source = match source.as_str() {
             "" | "monitor" | "fast" => ashpd::desktop::screencast::SourceType::MONITOR,
@@ -143,7 +154,7 @@ impl Luch {
             (w.and_then(|w| w["bench"]["prefer"].as_str()).unwrap_or("video/avc").to_string(),
              w.and_then(|w| w["max"].as_str()).map(str::to_string))
         };
-        let (width, height) = mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), max.as_deref());
+        let (width, height) = if explicit { (width, height) } else { mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), max.as_deref()) };
         let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, width, height };
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let stats = mirror::Stats::default();
@@ -173,6 +184,17 @@ impl Luch {
             changed(&conn).await;
         });
         Ok(())
+    }
+
+    /// Capture sources usable on this machine, best first (`fast`, `monitor`, `window`, `virtual`).
+    async fn sources(&self) -> Vec<String> {
+        mirror::available_sources().into_iter().map(String::from).collect()
+    }
+
+    /// The receiver's last `welcome` as JSON (decoders, `hw.display.modes`, `bench`), "{}" until
+    /// the control channel has been opened once. Does not connect by itself.
+    async fn capabilities(&self, id: String) -> String {
+        self.st.lock().await.welcomes.get(&id).map(|w| w.to_string()).unwrap_or_else(|| "{}".into())
     }
 
     /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.

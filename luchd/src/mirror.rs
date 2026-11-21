@@ -29,7 +29,14 @@ const UHD: (u32, u32) = (3840, 2160);
 pub const WIDTH: u32 = 1920;
 pub const HEIGHT: u32 = 1080;
 pub const FPS: u32 = 60;
-pub const VIDEO_KBPS: u32 = 20_000;
+pub const VIDEO_KBPS: u32 = 20_000; // at 1920x1080; other sizes scale, see `kbps_for`
+
+/// Video bitrate for a frame size: grows with the square root of the pixel count (4K gets twice
+/// the 1080p rate, not four times: Wi-Fi and TV decoders choke on 80 Mbit/s), never below 1080p's.
+pub fn kbps_for(w: u32, h: u32) -> u32 {
+    let ratio = (w as f64 * h as f64) / (WIDTH as f64 * HEIGHT as f64);
+    (VIDEO_KBPS as f64 * ratio.sqrt()).max(VIDEO_KBPS as f64) as u32
+}
 pub const AUDIO_BPS: u32 = 128_000;
 pub const AUDIO_FRAME_MS: u32 = 5;
 
@@ -81,6 +88,20 @@ pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32)
             _ => (WIDTH, HEIGHT),
         },
     }
+}
+
+/// Capture sources this machine can actually use, best first.
+pub fn available_sources() -> Vec<&'static str> {
+    let on_path = |name: &str| {
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+            || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name).is_file())).unwrap_or(false)
+    };
+    let mut v = Vec::new();
+    if on_path("luch-kms") {
+        v.push("fast");
+    }
+    v.extend(["monitor", "window", "virtual"]);
+    v
 }
 
 /// Messages to the control-channel task.
@@ -195,13 +216,17 @@ fn pipeline(portal: Option<(i32, u32)>, width: u32, height: u32) -> Result<gst::
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
-    let scale = std::env::var("LUCH_SCALE").unwrap_or_else(|_| "fast".into());
-    let drm = std::env::var("LUCH_DRM_FORMAT").unwrap_or_else(|_| "NV12:0x0100000000000009".into());
+    // Newer gst-plugins-bad dropped vapostproc's `scale-method`; only pass it where it exists.
+    let has_scale = gst::ElementFactory::make("vapostproc").build().is_ok_and(|e| e.find_property("scale-method").is_some());
+    let scale = if has_scale { format!("scale-method={}", std::env::var("LUCH_SCALE").unwrap_or_else(|_| "fast".into())) } else { String::new() };
+    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD (DCC), linear. LUCH_DRM_FORMAT overrides.
+    let drm = std::env::var("LUCH_DRM_FORMAT").map(|d| format!("\"{d}\""))
+        .unwrap_or_else(|_| "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0\"}".into());
     // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
     let video = portal.map(|(fd, node)| format!(
         "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
            ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
-           ! vapostproc scale-method={scale} \
+           ! vapostproc {scale} \
            ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={width},height={height} \
            ! appsink name=v sync=false max-buffers=1 drop=true "
     )).unwrap_or_default();
@@ -308,7 +333,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>, size: (u32, u32)) -> 
                 let at_sink = timing(s, pts_rt).1;
                 let mut enc = encoder.lock().unwrap();
                 if enc.is_none() {
-                    match crate::enc::Encoder::open(&render_node(), size.0, size.1, FPS, VIDEO_KBPS) {
+                    match crate::enc::Encoder::open(&render_node(), size.0, size.1, FPS, kbps_for(size.0, size.1)) {
                         Ok(e) => *enc = Some(e),
                         Err(e) => {
                             report(e);
@@ -369,7 +394,7 @@ fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: (u32,
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
     let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
     let mut child = Command::new(&exe)
-        .args(["--size", &format!("{}x{}", size.0, size.1), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
+        .args(["--size", &format!("{}x{}", size.0, size.1), "--fps", &FPS.to_string(), "--kbps", &kbps_for(size.0, size.1).to_string()])
         .args(["--codec", if hevc { "hevc" } else { "h264" }])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -585,6 +610,13 @@ mod tests {
         assert_eq!(session_size(Some("3840x2160"), Some("1920x1080")), (1920, 1080));
         assert_eq!(session_size(Some("2561x1441"), None), (2560, 1440));
         assert_eq!(session_size(Some("99999x1080"), None), (1920, 1080));
+    }
+
+    #[test]
+    fn bitrate_scales_with_pixels_but_not_below_1080p() {
+        assert_eq!(kbps_for(1920, 1080), VIDEO_KBPS);
+        assert_eq!(kbps_for(1280, 720), VIDEO_KBPS);
+        assert_eq!(kbps_for(3840, 2160), VIDEO_KBPS * 2);
     }
 
     #[test]

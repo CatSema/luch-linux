@@ -66,6 +66,23 @@ monitor in every mode.
 
 Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirroring.
 
+### `MirrorSized(s id, s source, u width, u height)`
+
+Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x4320). `Mirror` is
+`MirrorSized` with 0x0, which means the default size (`LUCH_SIZE`, else 1920x1080). The video bitrate grows with the square root of the pixel count (4K gets
+twice the 1080p rate). The sizes a receiver can show are in `welcome.hw.display.modes` and
+`welcome.hw.video`; a receiver's decoder may not keep up with 4K at 60 fps, so check `Stats`.
+
+### `Sources() → as`
+
+Capture sources usable on this machine, best first: `fast` (only when `luch-kms` is installed),
+`monitor`, `window`, `virtual`. Front-ends should offer just these.
+
+### `Capabilities(s id) → s`
+
+The receiver's last `welcome` as JSON (`hw`, `bench`, decoders), `{}` until the control channel has
+been opened once (`Connect` or `Mirror`). It never connects by itself.
+
 ### `StopMirror(s id)`
 
 Stops mirroring and tells the receiver (`stop`). The control channel stays open.
