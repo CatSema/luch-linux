@@ -58,7 +58,8 @@ up. `source` selects how the screen is captured:
 | `fast` | KMS scanout via the `luch-kms` helper, EGL→NV12, VA-API encode | lowest (≈5–6 ms on the sender) | whole primary monitor; `luch-kms` needs `CAP_SYS_ADMIN` |
 | `monitor` | screencast portal (PipeWire, DMA-BUF) | ≈15–25 ms on the sender | GNOME asks which screen once, then remembers it |
 | `window` | screencast portal | as `monitor` | a single window |
-| `virtual` | screencast portal, virtual monitor | as `monitor` | extends the desktop with a new display |
+| `virtual` | screencast portal, virtual monitor | as `monitor` | extends the desktop with a new display. Under Niri with virtual outputs (`niri-virtual`): a headless output of exactly the stream size is created for the session and removed afterwards, recorded through Niri's ScreenCast without a picker |
+| `fast169` | as `fast` | as `fast` | Niri only: the monitor is switched to a 16:9 mode (the closest one at least as wide as the stream) for the session and restored afterwards, also after a `luchd` crash or restart; no letterbox, no scaling |
 
 The codec follows the receiver's decoder benchmark (`welcome.bench.prefer`): HEVC when it is
 faster there, otherwise H.264. Audio (Opus, 5 ms frames) is captured from the default output's
@@ -76,7 +77,7 @@ twice the 1080p rate). The sizes a receiver can show are in `welcome.hw.display.
 ### `Sources() → as`
 
 Capture sources usable on this machine, best first: `fast` (only when `luch-kms` is installed),
-`monitor`, `window`, `virtual`. Front-ends should offer just these.
+`fast169` (Niri), `virtual` (Niri with virtual outputs, otherwise the portal one), `monitor`, `window`. Front-ends should offer just these.
 
 ### `Capabilities(s id) → s`
 

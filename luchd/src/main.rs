@@ -129,12 +129,14 @@ impl Luch {
         if explicit && (!(320..=7680).contains(&width) || !(240..=4320).contains(&height) || width % 2 != 0 || height % 2 != 0) {
             return Err(fdo::Error::InvalidArgs(format!("bad size {width}x{height}")));
         }
-        let kms = source == "fast";
+        let mirror169 = source == "fast169";
+        let kms = source == "fast" || mirror169;
+        let niri_virtual = source == "virtual" && mirror::niri_virtual_available();
         let source = match source.as_str() {
-            "" | "monitor" | "fast" => ashpd::desktop::screencast::SourceType::MONITOR,
+            "" | "monitor" | "fast" | "fast169" => ashpd::desktop::screencast::SourceType::MONITOR,
             "window" => ashpd::desktop::screencast::SourceType::WINDOW,
             "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
-            s => return Err(fdo::Error::InvalidArgs(format!("source must be fast|monitor|window|virtual, not {s}"))),
+            s => return Err(fdo::Error::InvalidArgs(format!("source must be fast|fast169|monitor|window|virtual, not {s}"))),
         };
         if self.st.lock().await.mirrors.contains_key(&id) {
             return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
@@ -155,7 +157,7 @@ impl Luch {
              w.and_then(|w| w["max"].as_str()).map(str::to_string))
         };
         let (width, height) = if explicit { (width, height) } else { mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), max.as_deref()) };
-        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, width, height };
+        let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, width, height, niri_virtual, mirror169 };
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let stats = mirror::Stats::default();
         {
@@ -186,7 +188,7 @@ impl Luch {
         Ok(())
     }
 
-    /// Capture sources usable on this machine, best first (`fast`, `monitor`, `window`, `virtual`).
+    /// Capture sources usable on this machine, best first (`fast`, `fast169`, `virtual`, `monitor`, `window`).
     async fn sources(&self) -> Vec<String> {
         mirror::available_sources().into_iter().map(String::from).collect()
     }
@@ -548,6 +550,7 @@ fn short_host() -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     gstreamer::init()?;
+    mirror::restore_leftovers();
     let id = sender_id()?;
     let host = short_host();
     let st = Shared::default();

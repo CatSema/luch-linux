@@ -64,6 +64,10 @@ pub struct Target {
     /// Encoded frame size of this session, see `session_size`.
     pub width: u32,
     pub height: u32,
+    /// Niri with virtual outputs: make a headless output of exactly this size and record that.
+    pub niri_virtual: bool,
+    /// `fast` with the physical monitor switched to a 16:9 mode for the session (no letterbox).
+    pub mirror169: bool,
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -90,18 +94,142 @@ pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32)
     }
 }
 
-/// Capture sources this machine can actually use, best first.
+/// Restores the monitor's mode when the session ends.
+struct ModeGuard {
+    output: String,
+    orig: String,
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("niri").args(["msg", "output", &self.output, "mode", &self.orig]).output();
+        if let Ok(d) = crate::config_dir() {
+            let _ = std::fs::remove_file(d.join("restore-mode"));
+        }
+    }
+}
+
+/// After a crash or restart mid-session: put the monitor's mode back and drop headless outputs we made.
+pub fn restore_leftovers() {
+    use std::process::Command;
+    if let Some(d) = crate::config_dir().ok().map(|d| d.join("restore-mode")) {
+        if let Some((out, mode)) = std::fs::read_to_string(&d).ok().and_then(|t| t.trim().split_once(' ').map(|(a, b)| (a.to_string(), b.to_string()))) {
+            let _ = Command::new("niri").args(["msg", "output", &out, "mode", &mode]).output();
+        }
+        let _ = std::fs::remove_file(d);
+    }
+    let Ok(o) = Command::new("niri").args(["msg", "-j", "outputs"]).output() else { return };
+    let Ok(v) = serde_json::from_slice::<Value>(&o.stdout) else { return };
+    for name in v.as_object().into_iter().flat_map(|m| m.keys()).filter(|n| n.starts_with("LUCH-")) {
+        let _ = Command::new("niri-virtual").args(["msg", "remove-virtual-output", name]).output();
+    }
+}
+
+fn mode_spec(m: &Value) -> Option<(u64, u64, String)> {
+    let (w, h, r) = (m["width"].as_u64()?, m["height"].as_u64()?, m["refresh_rate"].as_u64()?);
+    Some((w, h, format!("{w}x{h}@{:.3}", r as f64 / 1000.0)))
+}
+
+/// Switch the biggest real output to a 16:9 mode at least `want_w` wide (else the widest 16:9),
+/// highest refresh first. `None` when already 16:9, or Niri doesn't answer.
+async fn switch_to_16x9(want_w: u32) -> Option<ModeGuard> {
+    let out = tokio::process::Command::new("niri").args(["msg", "-j", "outputs"]).output().await.ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let area = |o: &Value| o["modes"].get(o["current_mode"].as_u64().unwrap_or(0) as usize).and_then(mode_spec).map_or(0, |(w, h, _)| w * h);
+    let (name, o) = v.as_object()?.iter().filter(|(n, _)| !n.starts_with("LUCH-")).max_by_key(|(_, o)| area(o))?;
+    let modes = o["modes"].as_array()?;
+    let (cw, ch, orig) = modes.get(o["current_mode"].as_u64()? as usize).and_then(mode_spec)?;
+    if cw * 9 == ch * 16 {
+        return None;
+    }
+    let want = want_w as u64;
+    let best = modes
+        .iter()
+        .filter_map(|m| mode_spec(m).map(|(w, h, spec)| (w, h, m["refresh_rate"].as_u64().unwrap_or(0), spec)))
+        .filter(|(w, h, _, _)| w * 9 == h * 16)
+        .max_by_key(|(w, _, r, _)| (*w >= want, if *w >= want { u64::MAX - w } else { *w }, *r))?;
+    let st = tokio::process::Command::new("niri").args(["msg", "output", name, "mode", &best.3]).status().await.ok()?;
+    if !st.success() {
+        return None;
+    }
+    eprintln!("[luchd] monitor {name}: {orig} -> {} for the mirror", best.3);
+    if let Ok(d) = crate::config_dir() {
+        let _ = std::fs::write(d.join("restore-mode"), format!("{name} {orig}"));
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await; // modeset
+    Some(ModeGuard { output: name.clone(), orig })
+}
+
+/// A headless Niri output created for one session, and the Mutter-compatible ScreenCast session on it.
+struct NiriVirtual {
+    name: String,
+    session: zbus::Proxy<'static>,
+    node: u32,
+}
+
+impl Drop for NiriVirtual {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("niri-virtual").args(["msg", "remove-virtual-output", &self.name]).output();
+    }
+}
+
+/// Capture sources this machine can actually use, best first. Niri-only ones appear only under Niri.
 pub fn available_sources() -> Vec<&'static str> {
     let on_path = |name: &str| {
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
             || std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name).is_file())).unwrap_or(false)
     };
+    let niri = std::env::var_os("NIRI_SOCKET").is_some() && on_path("niri");
     let mut v = Vec::new();
     if on_path("luch-kms") {
         v.push("fast");
+        if niri {
+            v.push("fast169");
+        }
     }
-    v.extend(["monitor", "window", "virtual"]);
+    if niri_virtual_available() {
+        v.push("virtual");
+    }
+    v.extend(["monitor", "window"]);
     v
+}
+
+pub fn niri_virtual_available() -> bool {
+    std::env::var_os("NIRI_SOCKET").is_some()
+        && std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("niri-virtual").is_file()))
+}
+
+async fn niri_virtual(name: &str, (w, h): (u32, u32)) -> Result<NiriVirtual, String> {
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedObjectPath, Value};
+    let out = tokio::process::Command::new("niri-virtual")
+        .args(["msg", "create-virtual-output", "--name", name, "--width", &w.to_string(), "--height", &h.to_string(), "--refresh-rate", &FPS.to_string()])
+        .output()
+        .await
+        .map_err(|e| format!("niri-virtual: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("niri-virtual: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    // From here on the output must go away on any error, so wrap it before the fallible calls.
+    let e = |e: zbus::Error| format!("niri screencast: {e}");
+    let conn = zbus::Connection::session().await.map_err(e)?;
+    const DEST: &str = "org.gnome.Mutter.ScreenCast";
+    let sc = zbus::Proxy::new(&conn, DEST, "/org/gnome/Mutter/ScreenCast", DEST).await.map_err(e)?;
+    let opts: HashMap<&str, Value> = HashMap::new();
+    let spath: OwnedObjectPath = sc.call("CreateSession", &(opts,)).await.map_err(e)?;
+    let session = zbus::Proxy::new(&conn, DEST, spath, "org.gnome.Mutter.ScreenCast.Session").await.map_err(e)?;
+    let mut ropts: HashMap<&str, Value> = HashMap::new();
+    ropts.insert("cursor-mode", Value::U32(1)); // embedded
+    let stream_path: OwnedObjectPath = session.call("RecordMonitor", &(name, ropts)).await.map_err(e)?;
+    let stream = zbus::Proxy::new(&conn, DEST, stream_path, "org.gnome.Mutter.ScreenCast.Stream").await.map_err(e)?;
+    let mut added = stream.receive_signal("PipeWireStreamAdded").await.map_err(e)?;
+    session.call::<_, _, ()>("Start", &()).await.map_err(e)?;
+    let msg = tokio::time::timeout(Duration::from_secs(5), added.next())
+        .await
+        .map_err(|_| "niri screencast: no stream".to_string())?
+        .ok_or("niri screencast: closed")?;
+    let node: u32 = msg.body().deserialize().map_err(|e| format!("niri screencast: {e}"))?;
+    Ok(NiriVirtual { name: name.to_string(), session, node })
 }
 
 /// Messages to the control-channel task.
@@ -212,7 +340,7 @@ async fn portal(source: SourceType) -> Result<(Screencast, ashpd::desktop::Sessi
 }
 
 /// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
-fn pipeline(portal: Option<(i32, u32)>, width: u32, height: u32) -> Result<gst::Pipeline, String> {
+fn pipeline(portal: Option<(Option<i32>, u32)>, width: u32, height: u32) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
@@ -223,8 +351,8 @@ fn pipeline(portal: Option<(i32, u32)>, width: u32, height: u32) -> Result<gst::
     let drm = std::env::var("LUCH_DRM_FORMAT").map(|d| format!("\"{d}\""))
         .unwrap_or_else(|_| "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0\"}".into());
     // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
-    let video = portal.map(|(fd, node)| format!(
-        "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
+    let video = portal.map(|(fd, node)| (fd.map(|f| format!("fd={f}")).unwrap_or_default(), node)).map(|(fd, node)| format!(
+        "pipewiresrc {fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
            ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
            ! vapostproc {scale} \
            ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={width},height={height} \
@@ -474,7 +602,9 @@ pub async fn run(
     mut stop: mpsc::Receiver<()>,
     stats: Stats,
 ) -> Result<&'static str, String> {
-    let portal = if t.kms { None } else { Some(portal(t.source).await?) };
+    let portal = if t.kms || t.niri_virtual { None } else { Some(portal(t.source).await?) };
+    let _mode = if t.kms && t.mirror169 { switch_to_16x9(t.width).await } else { None };
+    let nv = if t.niri_virtual { Some(niri_virtual(&format!("LUCH-{}", t.address.to_string().replace('.', "-")), (t.width, t.height)).await?) } else { None };
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
@@ -501,7 +631,7 @@ pub async fn run(
     let video = Arc::new(Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40).map_err(io)?);
     let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
 
-    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)), t.width, t.height)?;
+    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (Some(fd.as_raw_fd()), *node)).or(nv.as_ref().map(|n| (None, n.node))), t.width, t.height)?;
     let (want_idr, need_head) = wire(&p, video.clone(), audio, (t.width, t.height));
     let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc, (t.width, t.height))?) } else { None };
     if std::env::var_os("LUCH_PROBE").is_some() {
@@ -576,6 +706,9 @@ pub async fn run(
     if let Some(mut k) = kms {
         let _ = k.kill();
         let _ = k.wait();
+    }
+    if let Some(n) = nv {
+        let _ = n.session.call::<_, _, ()>("Stop", &()).await;
     }
     if let Some((_sc, session, fd, _)) = portal {
         let _ = session.close().await;
