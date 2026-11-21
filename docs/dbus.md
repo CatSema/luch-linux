@@ -66,6 +66,10 @@ monitor in every mode.
 
 Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirroring.
 
+While a session runs, `luchd` holds `org.freedesktop.ScreenSaver.Inhibit` (KDE, GNOME and Steam answer it), so the
+screen does not go to sleep under the stream: a sleeping screen has nothing to capture. Nothing happens where nothing
+answers that interface.
+
 ### `StopMirror(s id)`
 
 Stops mirroring and tells the receiver (`stop`). The control channel stays open.
