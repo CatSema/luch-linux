@@ -17,6 +17,11 @@ Receivers seen only on point-to-point links (VPN tunnels) are ignored. If one ap
 interfaces, the one on the main LAN interface wins. Every socket to a receiver is bound to the
 interface it was discovered on, so a full-tunnel VPN never carries the stream.
 
+Avahi's `ItemNew`/`ItemRemove` events drive the list. Every minute the daemon re-enumerates
+the advertised services and resolves their SRV/TXT/address records again, including previous
+timeouts. A temporary resolution failure preserves the last known receiver; `ItemRemove`
+removes it and cancels any pending lookup.
+
 ## Methods
 
 ### `Receivers() → a(sssssqbb)`
@@ -34,12 +39,24 @@ Returns every known receiver as a tuple:
 | 6 | `b` | a control channel is open |
 | 7 | `b` | mirroring is running |
 
+### `Refresh()`
+
+Requests an immediate Avahi rescan and resolution of advertised services. Returns immediately;
+read `Receivers()` for the current cache and listen for `ReceiversChanged()` for updates.
+Overlapping requests share in-flight lookups. This does not connect to receivers or interrupt
+active streams. The GNOME menu calls it when opened; the TUI calls it on entry and on `r`/Enter.
+The CLI also exposes `luchctl refresh`.
+
 ### `Connect(s id) → s`
 
 Opens the control channel (TCP, JSON lines) and keeps it alive with a ping every second.
 Returns the receiver's `welcome` message as a JSON string: decoders, maximum size, hardware
 passport (`hw`) and decoder benchmark (`bench`). `Mirror` connects by itself, so calling this is
 optional.
+
+Before connecting, resolves the selected receiver again to obtain its current address and port,
+sharing an existing lookup if one is running. A resolution error fails the connection attempt
+but keeps the last known entry in the list.
 
 Errors: `org.freedesktop.DBus.Error.InvalidArgs` for an unknown id, `org.freedesktop.DBus.Error.Failed`
 if already connected or the handshake fails.
@@ -63,6 +80,17 @@ up. `source` selects how the screen is captured:
 The codec follows the receiver's decoder benchmark (`welcome.bench.prefer`): HEVC when it is
 faster there, otherwise H.264. Audio (Opus, 5 ms frames) is captured from the default output's
 monitor in every mode.
+
+In `virtual` mode, the receiver’s display size is used for the virtual monitor, capture and
+encoded stream. Android receivers supply physical display modes (`hw.display.modes`, the largest
+resolution wins); browser receivers supply screen dimensions in physical pixels. Decoder `max`
+is not used as the display size. Older receivers without display information fall back to
+1920×1080; NV12 dimensions are rounded down to even pixels. GNOME places the new monitor to the
+right of the rightmost active monitor, aligned at its top edge, using a temporary configuration.
+The GNOME extension draws the real cursor texture over this monitor to work around missing
+cursor repaints in Mutter, while keeping capture and encoding on the GPU. The stream stats
+identify this connector as `sender.virtual_monitor` (null for other capture modes).
+GNOME 50 still labels portal-created monitors `MetaVendor`: its API has no display-name setter.
 
 Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirroring.
 
@@ -93,7 +121,7 @@ The same sender numbers are sent to the receiver (`sender_stats`) for its on-scr
 
 ### `ReceiversChanged()`
 
-Emitted when a receiver appears or disappears, or a connection or mirroring session starts or ends.
+Emitted when a receiver appears, disappears or changes its metadata, or a connection or mirroring session starts or ends.
 Call `Receivers()` again to get the new state.
 
 ## Properties
@@ -102,6 +130,26 @@ Call `Receivers()` again to get the new state.
 
 This machine's id (UUID kept in `~/.config/luch/id`). It is also announced as `_luchsrc._tcp`, so
 receivers can show which senders are nearby.
+
+### `WebUrl` (`s`, read)
+
+`https://<lan-ip>:47801/` — the built-in web receiver, or an empty string with no default route.
+Open it in any browser with WebCodecs (a TV browser will do); the page connects back over a
+secure websocket, appears in `Receivers()` like any other receiver and starts mirroring after pressing Watch
+(add `?mode=none` to stay manual, `?mode=monitor|window|virtual` to pick the source).
+
+HTTPS runs locally without a domain or internet access. On first opening, the browser warns about
+the self-signed certificate; proceed if the browser allows it. Some browsers require importing the
+certificate as trusted before enabling WebCodecs; if the TV cannot do that, use the Android receiver.
+Plain LAN HTTP cannot enable WebCodecs and redirects to HTTPS.
+The certificate and private key live in `~/.config/luch/web-cert.pem` and `web-key.pem`
+(or `$XDG_CONFIG_HOME/luch/`). The key is owner-only. The certificate survives restarts; connecting
+through a new IP reissues it with the same key, so the browser may ask for trust again.
+To check the certificate fingerprint on the laptop:
+
+```sh
+openssl x509 -in "${XDG_CONFIG_HOME:-$HOME/.config}/luch/web-cert.pem" -noout -fingerprint -sha256
+```
 
 ## Examples
 

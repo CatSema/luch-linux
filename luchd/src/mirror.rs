@@ -21,10 +21,12 @@ use futures_util::StreamExt;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use serde_json::{json, Value};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 
-pub const WIDTH: u32 = 1920;
-pub const HEIGHT: u32 = 1080;
+use crate::display::{Layout, Size};
+
+static VIRTUAL_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub const FPS: u32 = 60;
 pub const VIDEO_KBPS: u32 = 20_000;
 pub const AUDIO_BPS: u32 = 128_000;
@@ -47,10 +49,13 @@ pub struct Target {
     pub address: Ipv4Addr,
     pub ifname: String,
     pub source: SourceType,
+    pub size: Size,
     /// Full screen straight from KMS scanout via the privileged luch-kms helper (lowest latency).
     pub kms: bool,
     /// Receiver's preferred decoder from its welcome bench ("video/hevc" or "video/avc").
     pub prefer: String,
+    /// Web receiver: browsers take no UDP, media goes over its websocket instead.
+    pub ws: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 /// Messages to the control-channel task.
@@ -74,14 +79,21 @@ pub fn header(kind: u8, flags: u8, idx: u16, shards: u16, seq: u32, pts_us: u32,
     h
 }
 
-/// One UDP socket per media kind, pinned to the LAN interface.
+/// One UDP socket per media kind, pinned to the LAN interface — or a websocket for the web receiver.
 struct Tx {
-    sock: UdpSocket,
+    out: Out,
     kind: u8,
     seq: AtomicU32,
     warned: AtomicBool,
     bytes: AtomicU64,
     lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
+}
+
+enum Out {
+    Udp(UdpSocket),
+    /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
+    /// drop the frame and ask for an IDR — the browser lags, the stream must not.
+    Ws(mpsc::Sender<Vec<u8>>, Arc<AtomicBool>),
 }
 
 /// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
@@ -96,7 +108,11 @@ impl Tx {
         s.set_tos_v4(dscp << 2)?; // CS5 video / CS6 audio -> Wi-Fi WMM video/voice queues
         s.set_send_buffer_size(1 << 20)?;
         s.connect(&to.into())?;
-        Ok(Tx { sock: s.into(), kind, seq: AtomicU32::new(0), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) })
+        Ok(Tx { out: Out::Udp(s.into()), kind, seq: AtomicU32::new(0), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) })
+    }
+
+    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, want_idr: Arc<AtomicBool>) -> Self {
+        Tx { out: Out::Ws(tx, want_idr), kind, seq: AtomicU32::new(0), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) }
     }
 
     // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
@@ -108,18 +124,30 @@ impl Tx {
             eprintln!("[luchd] first {} frame: {} bytes", if self.kind == KIND_VIDEO { "video" } else { "audio" }, data.len());
         }
         let shards = data.len().div_ceil(SHARD).max(1);
-        let mut pkt = Vec::with_capacity(HEADER + SHARD);
-        for (i, chunk) in data.chunks(SHARD).enumerate() {
-            if i > 0 && i % BURST == 0 {
-                std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
+        match &self.out {
+            Out::Udp(sock) => {
+                let mut pkt = Vec::with_capacity(HEADER + SHARD);
+                for (i, chunk) in data.chunks(SHARD).enumerate() {
+                    if i > 0 && i % BURST == 0 {
+                        std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
+                    }
+                    pkt.clear();
+                    pkt.extend_from_slice(&header(self.kind, flags, i as u16, shards as u16, seq, pts_us as u32, data.len() as u32, host_lat));
+                    pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
+                    // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
+                    if let Err(e) = sock.send(&pkt) {
+                        if !self.warned.swap(true, Ordering::Relaxed) {
+                            eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
+                        }
+                    }
+                }
             }
-            pkt.clear();
-            pkt.extend_from_slice(&header(self.kind, flags, i as u16, shards as u16, seq, pts_us as u32, data.len() as u32, host_lat));
-            pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
-            // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
-            if let Err(e) = self.sock.send(&pkt) {
-                if !self.warned.swap(true, Ordering::Relaxed) {
-                    eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
+            Out::Ws(tx, want_idr) => {
+                let mut msg = Vec::with_capacity(HEADER + data.len());
+                msg.extend_from_slice(&header(self.kind, flags, 0, 1, seq, pts_us as u32, data.len() as u32, host_lat));
+                msg.extend_from_slice(data);
+                if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = tx.try_send(msg) {
+                    want_idr.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -139,40 +167,52 @@ pub fn opus_head() -> [u8; 19] {
 
 async fn portal(source: SourceType) -> Result<(Screencast, ashpd::desktop::Session<Screencast>, OwnedFd, u32), String> {
     let e = |e: ashpd::Error| format!("portal: {e}");
-    let token_path = crate::config_dir().map(|d| d.join("restore-token")).map_err(|e| e.to_string())?;
-    let token = std::fs::read_to_string(&token_path).ok().filter(|t| !t.trim().is_empty());
+    let token_name = if source == SourceType::VIRTUAL { "restore-token-virtual" } else if source == SourceType::WINDOW { "restore-token-window" } else { "restore-token" };
+    let token_path = crate::config_dir().map(|d| d.join(token_name)).map_err(|e| e.to_string())?;
+    let token = std::fs::read_to_string(&token_path).ok()
+        .or_else(|| token_path.parent().and_then(|d| std::fs::read_to_string(d.join("restore-token")).ok()))
+        .filter(|t| !t.trim().is_empty());
     let sc = Screencast::new().await.map_err(e)?;
-    let session = sc.create_session(Default::default()).await.map_err(e)?;
-    let opts = SelectSourcesOptions::default()
-        .set_cursor_mode(CursorMode::EMBEDDED)
-        .set_sources(source)
-        .set_multiple(false)
-        .set_persist_mode(PersistMode::ExplicitlyRevoked)
-        .set_restore_token(token.as_deref().map(str::trim));
-    sc.select_sources(&session, opts).await.map_err(e)?;
-    let streams = sc.start(&session, None, StartCastOptions::default()).await.map_err(e)?.response().map_err(e)?;
-    if let Some(t) = streams.restore_token() {
-        let _ = std::fs::write(&token_path, t);
+    // Old installations shared one token across source types. If it restores another type,
+    // close it and ask for the requested source instead of streaming the wrong desktop.
+    for restore in [token.as_deref().map(str::trim), None] {
+        let session = sc.create_session(Default::default()).await.map_err(e)?;
+        let opts = SelectSourcesOptions::default()
+            .set_cursor_mode(CursorMode::EMBEDDED)
+            .set_sources(source)
+            .set_multiple(false)
+            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+            .set_restore_token(restore);
+        sc.select_sources(&session, opts).await.map_err(e)?;
+        let streams = sc.start(&session, None, StartCastOptions::default()).await.map_err(e)?.response().map_err(e)?;
+        let stream = streams.streams().first().ok_or("portal: no stream selected")?;
+        if stream.source_type().is_some_and(|actual| actual != source) {
+            let _ = session.close().await;
+            continue;
+        }
+        if let Some(t) = streams.restore_token() { let _ = std::fs::write(&token_path, t); }
+        let node = stream.pipe_wire_node_id();
+        let fd = sc.open_pipe_wire_remote(&session, Default::default()).await.map_err(e)?;
+        return Ok((sc, session, fd, node));
     }
-    let stream = streams.streams().first().ok_or("portal: no stream selected")?;
-    let node = stream.pipe_wire_node_id();
-    let fd = sc.open_pipe_wire_remote(&session, Default::default()).await.map_err(e)?;
-    Ok((sc, session, fd, node))
+    Err("portal returned a different source type".into())
 }
 
 /// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
-fn pipeline(portal: Option<(i32, u32)>) -> Result<gst::Pipeline, String> {
+fn pipeline(portal: Option<(i32, u32)>, size: Size, virtual_source: bool) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
     // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
     // list when other GPUs matter.
     let scale = std::env::var("LUCH_SCALE").unwrap_or_else(|_| "fast".into());
     let drm = std::env::var("LUCH_DRM_FORMAT").unwrap_or_else(|_| "NV12:0x0100000000000009".into());
-    // Zero copy end to end: compositor DMA-BUF -> vapostproc (GPU scale + NV12) -> DMA-BUF -> h264_vaapi.
+    // Zero copy: compositor DMA-BUF -> GPU conversion -> DMA-BUF -> VA-API encoder.
+    let (width, height) = (size.width, size.height);
+    let capture_size = if virtual_source { format!(",width={width},height={height}") } else { String::new() };
     let video = portal.map(|(fd, node)| format!(
         "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=false keepalive-time={keepalive} \
-           ! video/x-raw(memory:DMABuf) ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
+           ! video/x-raw(memory:DMABuf){capture_size} ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
            ! vapostproc scale-method={scale} \
-           ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={WIDTH},height={HEIGHT} \
+           ! video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm},width={width},height={height} \
            ! appsink name=v sync=false max-buffers=1 drop=true "
     )).unwrap_or_default();
     let desc = format!(
@@ -237,12 +277,11 @@ fn render_node() -> String {
     nodes.into_iter().next().unwrap_or_else(|| "/dev/dri/renderD128".into())
 }
 
-/// Hooks both appsinks to the UDP senders; returns the "force an IDR" flag.
-/// Hooks the appsinks to the UDP senders; returns the "force an IDR" flag and the "resend OpusHead"
-/// flag (set on every video IDR). Without a "v" sink only audio is wired.
-fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+/// Hooks the appsinks to the senders; returns the "resend OpusHead" flag (set on every video IDR).
+/// `want_idr` is shared with a websocket sink, which sets it when it drops a frame.
+/// Without a "v" sink only audio is wired.
+fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>, want_idr: Arc<AtomicBool>, size: Size) -> Arc<AtomicBool> {
     let need_head = Arc::new(AtomicBool::new(true));
-    let want_idr = Arc::new(AtomicBool::new(false));
     let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
     let warned = AtomicBool::new(false);
     let dbg = Mutex::new((0f64, 0f64, 0u32));
@@ -278,7 +317,7 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, 
                 let at_sink = timing(s, pts_rt).1;
                 let mut enc = encoder.lock().unwrap();
                 if enc.is_none() {
-                    match crate::enc::Encoder::open(&render_node(), WIDTH, HEIGHT, FPS, VIDEO_KBPS) {
+                    match crate::enc::Encoder::open(&render_node(), size.width, size.height, FPS, VIDEO_KBPS) {
                         Ok(e) => *enc = Some(e),
                         Err(e) => {
                             report(e);
@@ -328,18 +367,18 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>) -> (Arc<AtomicBool>, 
             })
             .build(),
     );
-    (want_idr, need_head)
+    need_head
 }
 
 /// Lowest-latency video: spawns luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) and forwards its
 /// packets as they come. Returns the child; write b"k" to its stdin to force an IDR.
-fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool) -> Result<std::process::Child, String> {
+fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: Size) -> Result<std::process::Child, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
     let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
     let mut child = Command::new(&exe)
-        .args(["--size", &format!("{WIDTH}x{HEIGHT}"), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
+        .args(["--size", &format!("{}x{}", size.width, size.height), "--fps", &FPS.to_string(), "--kbps", &VIDEO_KBPS.to_string()])
         .args(["--codec", if hevc { "hevc" } else { "h264" }])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -419,12 +458,16 @@ pub async fn run(
     mut stop: mpsc::Receiver<()>,
     stats: Stats,
 ) -> Result<&'static str, String> {
+    let size = t.size;
+    let virtual_source = t.source == SourceType::VIRTUAL;
+    let virtual_setup = if virtual_source { Some(VIRTUAL_SETUP.lock().await) } else { None };
+    let layout = if virtual_source { Some(Layout::capture().await?) } else { None };
     let portal = if t.kms { None } else { Some(portal(t.source).await?) };
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
     let start = json!({"t": "start", "mode": "mirror",
-        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": WIDTH, "height": HEIGHT, "fps": FPS},
+        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS},
         "audio": {"codec": "audio/opus", "rate": 48000, "channels": 2, "frame_ms": AUDIO_FRAME_MS}});
     cmd.send(Cmd::Send(start)).await.map_err(|_| "control channel closed")?;
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -441,14 +484,22 @@ pub async fn run(
     .map_err(|_| "receiver did not answer start".to_string())??;
 
     let port = |k: &str| ready[k].as_u64().filter(|p| *p > 0 && *p < 65536).map(|p| p as u16);
-    let (vp, ap) = port("video_port").zip(port("audio_port")).ok_or(format!("bad ready: {ready}"))?;
-    let io = |e: std::io::Error| format!("udp: {e}");
-    let video = Arc::new(Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40).map_err(io)?);
-    let audio = Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?);
+    // Web receivers take media over their websocket; everything else gets UDP sockets.
+    let want_idr = Arc::new(AtomicBool::new(false));
+    let (video, audio) = if let Some(ws) = t.ws.clone() {
+        (Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), want_idr.clone())), Arc::new(Tx::ws(KIND_AUDIO, ws, want_idr.clone())))
+    } else {
+        let (vp, ap) = port("video_port").zip(port("audio_port")).ok_or(format!("bad ready: {ready}"))?;
+        let io = |e: std::io::Error| format!("udp: {e}");
+        (
+            Arc::new(Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40).map_err(io)?),
+            Arc::new(Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48).map_err(io)?),
+        )
+    };
 
-    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)))?;
-    let (want_idr, need_head) = wire(&p, video.clone(), audio);
-    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc)?) } else { None };
+    let p = pipeline(portal.as_ref().map(|(_, _, fd, node)| (fd.as_raw_fd(), *node)), size, virtual_source)?;
+    let need_head = wire(&p, video.clone(), audio, want_idr.clone(), size);
+    let mut kms = if t.kms { Some(spawn_kms(video.clone(), need_head, hevc, size)?) } else { None };
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -461,7 +512,19 @@ pub async fn run(
             _ => format!("pipeline: {e}"),
         });
     }
-    eprintln!("[luchd] mirroring to {} ({}: video {vp}, audio {ap})", t.name, t.address);
+    let virtual_monitor = if let Some(layout) = layout {
+        match layout.place_new_right(size).await {
+            Ok(connector) => Some(connector),
+            Err(e) => {
+                let _ = p.set_state(gst::State::Null);
+                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                if let Some((_, session, _, _)) = &portal { let _ = session.close().await; }
+                return Err(e);
+            }
+        }
+    } else { None };
+    drop(virtual_setup);
+    eprintln!("[luchd] mirroring to {} ({})", t.name, t.address);
 
     let mut bus = p.bus().unwrap().stream();
     let mut second = tokio::time::interval(Duration::from_secs(1));
@@ -479,7 +542,7 @@ pub async fn run(
                 let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
                 (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
-                                    "fps": df, "mbps": round1(mbps), "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{WIDTH}x{HEIGHT}")});
+                                    "fps": df, "mbps": round1(mbps), "virtual_monitor": virtual_monitor, "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{}x{}", size.width, size.height)});
                 let _ = cmd.send(Cmd::Send(sender.clone())).await;
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
@@ -555,8 +618,9 @@ mod tests {
     fn frame_is_sharded_and_reassembles() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let to = match rx.local_addr().unwrap() { std::net::SocketAddr::V4(a) => a, _ => unreachable!() };
-        let tx = Tx { sock: UdpSocket::bind("127.0.0.1:0").unwrap(), kind: KIND_VIDEO, seq: AtomicU32::new(7), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) };
-        tx.sock.connect(to).unwrap();
+        let tx = Tx { out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()), kind: KIND_VIDEO, seq: AtomicU32::new(7), warned: AtomicBool::new(false), bytes: AtomicU64::new(0), lat_sum: AtomicU64::new(0) };
+        let sock = match &tx.out { Out::Udp(s) => s, _ => unreachable!() };
+        sock.connect(to).unwrap();
         let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
         tx.send_frame(&frame, F_IDR, 1234, 5);
         let mut got = Vec::new();
@@ -569,5 +633,46 @@ mod tests {
             got.extend_from_slice(&buf[HEADER..n]);
         }
         assert_eq!(got, frame);
+    }
+
+    #[tokio::test]
+    async fn kms_idr_resends_opus_head_without_requesting_video_idr() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("appsrc name=src format=time ! appsink name=a sync=false")
+            .unwrap().downcast::<gst::Pipeline>().unwrap();
+        let src = pipeline.by_name("src").unwrap().downcast::<gst_app::AppSrc>().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let want_idr = Arc::new(AtomicBool::new(false));
+        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), want_idr.clone()));
+        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, want_idr.clone()));
+        let need_head = wire(&pipeline, video, audio, want_idr.clone(), Size::default());
+        pipeline.set_state(gst::State::Playing).unwrap();
+        for _ in 0..2 {
+            // The KMS forwarding thread sets this on every IDR.
+            need_head.store(true, Ordering::Relaxed);
+            src.push_buffer(gst::Buffer::from_mut_slice(vec![0xf8, 0xff, 0xfe])).unwrap();
+            let config = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+            let data = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(config[1], F_CONFIG);
+            assert_eq!(&config[HEADER..], &opus_head());
+            assert_eq!(data[1], 0);
+            assert!(!want_idr.load(Ordering::Relaxed));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_frame_is_one_whole_message() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let want_idr = Arc::new(AtomicBool::new(false));
+        let t = Tx::ws(KIND_AUDIO, tx, want_idr.clone());
+        let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
+        t.send_frame(&frame, F_CONFIG, 42, 3); // fills the channel
+        t.send_frame(&frame, 0, 43, 3); // full: dropped, an IDR is requested instead of stalling
+        let msg = rx.recv().await.unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(&msg[..HEADER], &header(KIND_AUDIO, F_CONFIG, 0, 1, 0, 42, frame.len() as u32, 3));
+        assert_eq!(&msg[HEADER..], &frame[..]);
+        assert!(want_idr.load(Ordering::Relaxed));
     }
 }

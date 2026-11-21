@@ -6,6 +6,7 @@ use luch_proto::ReceiverRow;
 #[zbus::proxy(interface = "dev.luch.Luch1", default_service = "dev.luch.Luch1", default_path = "/dev/luch/Luch1")]
 trait Luch1 {
     fn receivers(&self) -> zbus::Result<Vec<ReceiverRow>>;
+    fn refresh(&self) -> zbus::Result<()>;
     fn connect(&self, id: &str) -> zbus::Result<String>;
     fn disconnect(&self, id: &str) -> zbus::Result<()>;
     fn mirror(&self, id: &str, source: &str) -> zbus::Result<()>;
@@ -17,7 +18,7 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id]
+const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive";
 
 const SOURCES: [&str; 4] = ["fast", "monitor", "window", "virtual"];
@@ -57,7 +58,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     let p = Luch1Proxy::new(&conn).await.map_err(|e| e.to_string())?;
     let e = |e: zbus::Error| format!("{e} (is luchd running?)");
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["list"] => print(&p.receivers().await.map_err(e)?),
+        ["list"] => {
+            p.refresh().await.map_err(e)?;
+            print(&p.receivers().await.map_err(e)?);
+        }
+        ["refresh"] => p.refresh().await.map_err(e)?,
         ["id"] => println!("{}", p.sender_id().await.map_err(e)?),
         ["connect", key @ ..] if key.len() <= 1 => {
             let id = find_id(&p, key.first().copied()).await?;
@@ -85,6 +90,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         ["stop", key @ ..] if key.len() <= 1 => p.stop_mirror(&find_id(&p, key.first().copied()).await?).await.map_err(e)?,
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
+            p.refresh().await.map_err(e)?;
             print(&p.receivers().await.map_err(e)?);
             while changes.next().await.is_some() {
                 println!("--- changed");
@@ -125,7 +131,7 @@ fn draw(rows: &[ReceiverRow], stats: &[(usize, String)], note: &str) {
             println!("      {line}");
         }
     }
-    println!("\n  <N> connect/disconnect · f<N> fast full screen · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · q quit");
+    println!("\n  <N> connect/disconnect · f<N> fast full screen · m<N> mirror screen · w<N> one window · e<N> extend · s<N> stop · r refresh · q quit");
     if !note.is_empty() {
         println!("  {note}");
     }
@@ -138,6 +144,7 @@ fn draw(rows: &[ReceiverRow], stats: &[(usize, String)], note: &str) {
 async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
     use tokio::io::AsyncBufReadExt;
     let mut changes = p.receive_receivers_changed().await?;
+    p.refresh().await?;
     let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut rows = p.receivers().await?;
     let mut note = String::new();
@@ -172,14 +179,19 @@ async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
                 match (cmd, cmd.parse::<usize>()) {
                     ("q", _) => break,
                     (_, Ok(n)) if (1..=rows.len()).contains(&n) => {
-                        let (id, name, .., connected) = &rows[n - 1];
+                        let (id, name, _, _, _, _, connected, _) = &rows[n - 1];
                         let r: zbus::Result<&str> = if *connected { p.disconnect(id).await.map(|_| "disconnected") } else { p.connect(id).await.map(|_| "connected") };
                         note = match r {
                             Ok(s) => format!("{name}: {s}"),
                             Err(err) => format!("{name}: {err}"),
                         };
                     }
-                    ("" | "r", _) => {}
+                    ("" | "r", _) => {
+                        note = match p.refresh().await {
+                            Ok(()) => "refreshing receivers…".into(),
+                            Err(e) => e.to_string(),
+                        };
+                    }
                     _ => note = format!("unknown command: {cmd}"),
                 }
             }
