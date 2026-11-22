@@ -146,7 +146,7 @@ impl Luch {
         start_mirror(&self.st, conn, &id, &source, (width, height)).await
     }
 
-    /// Capture sources usable on this machine, best first (`fast`, `monitor`, `window`, `virtual`).
+    /// Capture sources usable on this machine, best first (`fast`, `fast169`, `virtual`, `monitor`, `window`).
     async fn sources(&self) -> Vec<String> {
         mirror::available_sources().into_iter().map(String::from).collect()
     }
@@ -337,9 +337,11 @@ async fn run_channel(
 
 /// Body of the D-Bus `Mirror` method and of the web receiver's auto-start: one session to `id`.
 async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, requested: (u32, u32)) -> fdo::Result<()> {
-    let kms = source == "fast";
+    let mirror169 = source == "fast169";
+    let kms = source == "fast" || mirror169;
+    let niri_virtual = source == "virtual" && mirror::niri_virtual_available();
     let source = match source {
-        "" | "monitor" | "fast" => ashpd::desktop::screencast::SourceType::MONITOR,
+        "" | "monitor" | "fast" | "fast169" => ashpd::desktop::screencast::SourceType::MONITOR,
         "window" => ashpd::desktop::screencast::SourceType::WINDOW,
         "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
         s => return Err(fdo::Error::InvalidArgs(format!("source must be fast|monitor|window|virtual, not {s}"))),
@@ -363,7 +365,7 @@ async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, re
     } else { display::Size::default() };
     let ws = c.media.clone();
     let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-    let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, ws, size };
+    let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, ws, size, niri_virtual, mirror169 };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
     {
@@ -789,6 +791,7 @@ fn short_host() -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     gstreamer::init()?;
+    mirror::restore_leftovers();
     let id = sender_id()?;
     let host = short_host();
     let st = Shared::default();
