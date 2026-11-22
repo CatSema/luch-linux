@@ -4,7 +4,6 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as PointerWatcher from 'resource:///org/gnome/shell/ui/pointerWatcher.js';
 
 // Paint the actual cursor texture on the GPU, like GNOME's magnifier. No pixel readback.
 const CursorContent = GObject.registerClass({Implements: [Clutter.Content]},
@@ -47,6 +46,8 @@ export default class VirtualCursor {
         Main.uiGroup.add_child(this._actor);
         this._tracker = global.backend.get_cursor_tracker();
         this._spriteSignal = this._tracker.connect('cursor-changed', () => this._updatePointer());
+        // PointerWatcher was removed in GNOME 51; Mutter emits this on every pointer motion.
+        this._positionSignal = this._tracker.connect('position-invalidated', () => this._updatePointer());
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
@@ -90,12 +91,6 @@ export default class VirtualCursor {
         if (!this._alive)
             return;
         this._areas = areas;
-        if (areas.length > 0 && !this._watch)
-            this._watch = PointerWatcher.getPointerWatcher().addWatch(16, () => this._updatePointer());
-        else if (areas.length === 0 && this._watch) {
-            this._watch.remove();
-            this._watch = null;
-        }
         this._updatePointer();
     }
 
@@ -122,9 +117,8 @@ export default class VirtualCursor {
     destroy() {
         this._alive = false;
         GLib.source_remove(this._timer);
-        this._watch?.remove();
-        this._watch = null;
         this._tracker.disconnect(this._spriteSignal);
+        this._tracker.disconnect(this._positionSignal);
         this._actor.destroy();
         this._actor = null;
         this._content = null;
