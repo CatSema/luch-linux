@@ -120,10 +120,18 @@ impl Drop for Session {
     }
 }
 
-fn udp() -> std::io::Result<UdpSocket> {
-    let s = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
-    let _ = s.set_recv_buffer_size(4 << 20);
-    s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())?;
+/// The video and sound ports a firewall can be told about: 47802 and 47803; any free port when those are taken.
+pub const VIDEO_PORT: u16 = 47802;
+pub const AUDIO_PORT: u16 = 47803;
+
+fn udp(preferred: u16) -> std::io::Result<UdpSocket> {
+    let bind = |port: u16| -> std::io::Result<Socket> {
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+        let _ = s.set_recv_buffer_size(4 << 20);
+        s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+        Ok(s)
+    };
+    let s = bind(preferred).or_else(|_| bind(0))?;
     s.set_read_timeout(Some(Duration::from_millis(100)))?;
     Ok(s.into())
 }
@@ -135,8 +143,8 @@ impl Session {
             .unwrap_or("video/avc")
             .to_string();
         let player = Player::new(&codec)?;
-        let video = udp().map_err(|e| e.to_string())?;
-        let audio = udp().map_err(|e| e.to_string())?; // the sound is not played yet; its port is only held open
+        let video = udp(VIDEO_PORT).map_err(|e| e.to_string())?;
+        let audio = udp(AUDIO_PORT).map_err(|e| e.to_string())?; // the sound is not played yet; its port is only held open
         let ports = (
             video.local_addr().map_err(|e| e.to_string())?.port(),
             audio.local_addr().map_err(|e| e.to_string())?.port(),
