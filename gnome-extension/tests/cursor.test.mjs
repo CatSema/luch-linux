@@ -13,9 +13,10 @@ class Variant {
 function fixture(currentFlag = new Variant('b', true)) {
     let pointer = [2100, 100];
     const calls = [];
+    const signals = [];
     const texture = {get_width: () => 32, get_height: () => 48};
-    const tracker = {connect: () => 1, disconnect() {}, get_sprite: () => texture,
-        get_pointer_visible: () => true, get_hot: () => [4, 6]};
+    const tracker = {connect: name => { signals.push(name); return 1; }, disconnect() {},
+        get_sprite: () => texture, get_pointer_visible: () => true, get_hot: () => [4, 6]};
     const group = {add_child() {}, set_child_above_sibling() {}};
     const Main = {uiGroup: group, sessionMode: {isLocked: false}};
     class Actor {
@@ -42,15 +43,16 @@ function fixture(currentFlag = new Variant('b', true)) {
     }}};
     const context = vm.createContext({Gio, Main, GLib: {Variant, timeout_add_seconds: () => 1, source_remove() {}},
         GObject: {registerClass: (meta, type) => type, Object: class {invalidate() {}}},
-        Clutter: {Content: {}, Actor}, PointerWatcher: {getPointerWatcher: () => ({addWatch: () => ({remove() {}})})},
-        global: {get_pointer: () => pointer, backend: {get_cursor_tracker: () => tracker}}, console});
+        Clutter: {Content: {}, Actor}, global: {get_pointer: () => pointer, backend: {get_cursor_tracker: () => tracker}}, console});
     vm.runInContext(source + '\nglobalThis.cursor = new VirtualCursor();', context);
-    return {cursor: context.cursor, Main, calls, answers, move: (x, y) => {pointer = [x, y]; context.cursor._updatePointer();}};
+    return {cursor: context.cursor, Main, calls, answers, signals,
+        move: (x, y) => {pointer = [x, y]; context.cursor._updatePointer();}};
 }
 
 test('draws real cursor with hotspot on our scaled virtual monitor only', async () => {
     const f = fixture(); await flush();
     assert.equal(f.cursor._actor.visible, true);
+    assert.deepEqual(f.signals, ['cursor-changed', 'position-invalidated']);
     assert.deepEqual(Array.from(f.cursor._actor.position), [2098, 97]);
     assert.deepEqual(Array.from(f.cursor._actor.size), [16, 24]);
     f.move(100, 100);
@@ -69,7 +71,6 @@ test('accepts unpacked mode flags and removes cursor when stream stops', async (
     f.answers.Stats = ['{}'];
     await f.cursor._refresh();
     assert.equal(f.cursor._actor.visible, false);
-    assert.equal(f.cursor._watch, null);
     f.cursor.destroy();
 });
 
