@@ -695,6 +695,21 @@ name = "luch-proto"
 version = "0.2.0"
 
 [[package]]
+name = "luch-recv"
+version = "0.2.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-app",
+ "libc",
+ "luch-proto",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "uuid",
+ "zbus 5.19.0",
+]
+
+[[package]]
 name = "luchctl"
 version = "0.2.0"
 dependencies = [
