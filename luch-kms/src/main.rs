@@ -22,7 +22,9 @@ fn options(line: &str) -> Option<Vec<String>> {
     while let Some(k) = it.next() {
         let v = it.next()?;
         let ok = match k {
-            "--size" => v.split_once('x').is_some_and(|(w, h)| w.parse::<u32>().is_ok() && h.parse::<u32>().is_ok()),
+            "--size" => v
+                .split_once('x')
+                .is_some_and(|(w, h)| w.parse::<u32>().is_ok() && h.parse::<u32>().is_ok()),
             "--fps" | "--kbps" => v.parse::<u32>().is_ok(),
             "--codec" => v == "h264" || v == "hevc",
             _ => false,
@@ -63,14 +65,19 @@ fn serve(path: &str, uid: Option<u32>) -> std::io::Result<()> {
         // The first line, read byte by byte so nothing of the stream is swallowed.
         let mut line = Vec::new();
         let mut b = [0u8; 1];
-        while line.len() < 256 && conn.read(&mut b).map(|n| n == 1).unwrap_or(false) && b[0] != b'\n' {
+        while line.len() < 256
+            && conn.read(&mut b).map(|n| n == 1).unwrap_or(false)
+            && b[0] != b'\n'
+        {
             line.push(b[0]);
         }
         let Some(args) = options(&String::from_utf8_lossy(&line)) else {
             eprintln!("luch-kms: refused options");
             continue;
         };
-        let Ok(input) = conn.try_clone() else { continue };
+        let Ok(input) = conn.try_clone() else {
+            continue;
+        };
         let _ = Command::new(&exe)
             .args(args)
             .stdin(Stdio::from(OwnedFd::from(input)))
@@ -84,7 +91,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--serve") {
         let path = args.get(i + 1).cloned().unwrap_or_default();
-        let uid = args.iter().position(|a| a == "--uid").and_then(|j| args.get(j + 1)).and_then(|v| v.parse().ok());
+        let uid = args
+            .iter()
+            .position(|a| a == "--uid")
+            .and_then(|j| args.get(j + 1))
+            .and_then(|v| v.parse().ok());
         if path.is_empty() || serve(&path, uid).is_err() {
             eprintln!("luch-kms: cannot serve {path}");
             std::process::exit(1);

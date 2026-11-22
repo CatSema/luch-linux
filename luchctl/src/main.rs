@@ -3,7 +3,11 @@
 use futures_util::StreamExt;
 use luch_proto::ReceiverRow;
 
-#[zbus::proxy(interface = "dev.luch.Luch1", default_service = "dev.luch.Luch1", default_path = "/dev/luch/Luch1")]
+#[zbus::proxy(
+    interface = "dev.luch.Luch1",
+    default_service = "dev.luch.Luch1",
+    default_path = "/dev/luch/Luch1"
+)]
 trait Luch1 {
     fn receivers(&self) -> zbus::Result<Vec<ReceiverRow>>;
     fn refresh(&self) -> zbus::Result<()>;
@@ -28,10 +32,22 @@ fn print(rows: &[ReceiverRow]) {
         println!("(no receivers)");
         return;
     }
-    println!("{:<38} {:<20} {:<16} {:<21} {:<10} STATE", "ID", "NAME", "MODEL", "ADDRESS", "IFACE");
+    println!(
+        "{:<38} {:<20} {:<16} {:<21} {:<10} STATE",
+        "ID", "NAME", "MODEL", "ADDRESS", "IFACE"
+    );
     for (id, name, model, addr, ifname, port, connected, mirroring) in rows {
-        let state = if *mirroring { "mirroring" } else if *connected { "connected" } else { "-" };
-        println!("{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {state}", format!("{addr}:{port}"));
+        let state = if *mirroring {
+            "mirroring"
+        } else if *connected {
+            "connected"
+        } else {
+            "-"
+        };
+        println!(
+            "{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {state}",
+            format!("{addr}:{port}")
+        );
     }
 }
 
@@ -42,10 +58,16 @@ async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String
         return match rows.as_slice() {
             [one] => Ok(one.0.clone()),
             [] => Err("no receivers found (is the receiver app running?)".into()),
-            _ => Err(format!("{} receivers on the LAN, name one (see `luchctl list`)", rows.len())),
+            _ => Err(format!(
+                "{} receivers on the LAN, name one (see `luchctl list`)",
+                rows.len()
+            )),
         };
     };
-    let hits: Vec<_> = rows.iter().filter(|r| r.0 == key || r.1.eq_ignore_ascii_case(key)).collect();
+    let hits: Vec<_> = rows
+        .iter()
+        .filter(|r| r.0 == key || r.1.eq_ignore_ascii_case(key))
+        .collect();
     match hits.as_slice() {
         [one] => Ok(one.0.clone()),
         [] => Err(format!("no receiver '{key}' (see `luchctl list`)")),
@@ -54,10 +76,17 @@ async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String
 }
 
 async fn run(args: &[String]) -> Result<(), String> {
-    let conn = zbus::Connection::session().await.map_err(|e| e.to_string())?;
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| e.to_string())?;
     let p = Luch1Proxy::new(&conn).await.map_err(|e| e.to_string())?;
     let e = |e: zbus::Error| format!("{e} (is luchd running?)");
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["list"] => {
             p.refresh().await.map_err(e)?;
             print(&p.receivers().await.map_err(e)?);
@@ -72,14 +101,26 @@ async fn run(args: &[String]) -> Result<(), String> {
                 .unwrap_or(welcome);
             println!("{pretty}");
         }
-        ["disconnect", key @ ..] if key.len() <= 1 => p.disconnect(&find_id(&p, key.first().copied()).await?).await.map_err(e)?,
-        ["mirror"] => p.mirror(&find_id(&p, None).await?, "fast").await.map_err(e)?,
+        ["disconnect", key @ ..] if key.len() <= 1 => p
+            .disconnect(&find_id(&p, key.first().copied()).await?)
+            .await
+            .map_err(e)?,
+        ["mirror"] => p
+            .mirror(&find_id(&p, None).await?, "fast")
+            .await
+            .map_err(e)?,
         // `mirror fast` with a single receiver: a known source word that isn't a receiver name.
         ["mirror", one] if SOURCES.contains(one) && find_id(&p, Some(one)).await.is_err() => {
             p.mirror(&find_id(&p, None).await?, one).await.map_err(e)?
         }
-        ["mirror", key] => p.mirror(&find_id(&p, Some(key)).await?, "fast").await.map_err(e)?,
-        ["mirror", key, source] => p.mirror(&find_id(&p, Some(key)).await?, source).await.map_err(e)?,
+        ["mirror", key] => p
+            .mirror(&find_id(&p, Some(key)).await?, "fast")
+            .await
+            .map_err(e)?,
+        ["mirror", key, source] => p
+            .mirror(&find_id(&p, Some(key)).await?, source)
+            .await
+            .map_err(e)?,
         ["stats", key @ ..] if key.len() <= 1 => {
             let id = find_id(&p, key.first().copied()).await?;
             loop {
@@ -87,7 +128,10 @@ async fn run(args: &[String]) -> Result<(), String> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        ["stop", key @ ..] if key.len() <= 1 => p.stop_mirror(&find_id(&p, key.first().copied()).await?).await.map_err(e)?,
+        ["stop", key @ ..] if key.len() <= 1 => p
+            .stop_mirror(&find_id(&p, key.first().copied()).await?)
+            .await
+            .map_err(e)?,
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
             p.refresh().await.map_err(e)?;
@@ -125,8 +169,17 @@ fn draw(rows: &[ReceiverRow], stats: &[(usize, String)], note: &str) {
         println!("  (searching…)");
     }
     for (i, (_, name, model, addr, ifname, port, connected, mirroring)) in rows.iter().enumerate() {
-        let mark = if *mirroring { "▶" } else if *connected { "●" } else { "○" };
-        println!("  {} {mark} {name:<24} {model:<14} {addr}:{port} ({ifname})", i + 1);
+        let mark = if *mirroring {
+            "▶"
+        } else if *connected {
+            "●"
+        } else {
+            "○"
+        };
+        println!(
+            "  {} {mark} {name:<24} {model:<14} {addr}:{port} ({ifname})",
+            i + 1
+        );
         if let Some((_, line)) = stats.iter().find(|(j, _)| *j == i) {
             println!("      {line}");
         }

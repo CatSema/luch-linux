@@ -19,11 +19,11 @@ use tokio::{
     sync::{broadcast, mpsc, Mutex},
     time::{timeout, Instant},
 };
+use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 use zbus::{
     fdo, interface, message::Type as MsgType, object_server::SignalEmitter,
     zvariant::OwnedObjectPath, Connection, MatchRule, MessageStream,
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 const AVAHI: &str = "org.freedesktop.Avahi";
 const AVAHI_SERVER: &str = "org.freedesktop.Avahi.Server";
@@ -80,7 +80,16 @@ impl Luch {
             .values()
             .map(|r| {
                 let (c, m) = (st.conns.contains_key(&r.id), st.mirrors.contains_key(&r.id));
-                (r.id.clone(), r.name.clone(), r.model.clone(), r.address.clone(), r.ifname.clone(), r.port, c, m)
+                (
+                    r.id.clone(),
+                    r.name.clone(),
+                    r.model.clone(),
+                    r.address.clone(),
+                    r.ifname.clone(),
+                    r.port,
+                    c,
+                    m,
+                )
             })
             .collect();
         rows.sort();
@@ -93,7 +102,11 @@ impl Luch {
     }
 
     /// Opens and keeps a control channel; returns the receiver's welcome as JSON.
-    async fn connect(&self, id: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<String> {
+    async fn connect(
+        &self,
+        id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
         {
             let st = self.st.lock().await;
             if st.conns.contains_key(&id) {
@@ -103,20 +116,45 @@ impl Luch {
                 return Err(fdo::Error::InvalidArgs(format!("unknown receiver: {id}")));
             }
         }
-        let r = self.discovery.receiver(id.clone()).await.map_err(fdo::Error::Failed)?;
+        let r = self
+            .discovery
+            .receiver(id.clone())
+            .await
+            .map_err(fdo::Error::Failed)?;
         let (welcome, rd, wr) = handshake(&r, &self.sender_id, &self.host)
             .await
-            .map_err(|e| fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname)))?;
+            .map_err(|e| {
+                fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
+            })?;
         let (tx, rx) = mpsc::channel(8);
         let (events, _) = broadcast::channel(16);
         {
             let mut st = self.st.lock().await;
-            st.conns.insert(id.clone(), Conn { cmd: tx, events: events.clone(), media: None });
+            st.conns.insert(
+                id.clone(),
+                Conn {
+                    cmd: tx,
+                    events: events.clone(),
+                    media: None,
+                },
+            );
             st.welcomes.insert(id.clone(), welcome.clone());
         }
-        eprintln!("[luchd] connected to {} ({}:{} via {})", r.name, r.address, r.port, r.ifname);
+        eprintln!(
+            "[luchd] connected to {} ({}:{} via {})",
+            r.name, r.address, r.port, r.ifname
+        );
         changed(conn).await;
-        tokio::spawn(run_channel(r.name, id, rd, wr, rx, events, self.st.clone(), conn.clone()));
+        tokio::spawn(run_channel(
+            r.name,
+            id,
+            rd,
+            wr,
+            rx,
+            events,
+            self.st.clone(),
+            conn.clone(),
+        ));
         Ok(welcome.to_string())
     }
 
@@ -132,13 +170,32 @@ impl Luch {
     /// "monitor", "window" or "virtual" (a new GNOME virtual monitor, i.e. extend) via the
     /// screencast portal: its picker is shown the first time, later runs reuse a saved token.
     /// Returns once the session is set up; it then runs until StopMirror or the receiver stops it.
-    async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+    async fn mirror(
+        &self,
+        id: String,
+        source: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
         self.mirror_sized(id, source, 0, 0, conn).await
     }
 
-    async fn mirror_sized(&self, id: String, source: String, width: u32, height: u32, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
-        if (width, height) != (0, 0) && (!(320..=7680).contains(&width) || !(240..=4320).contains(&height) || width % 2 != 0 || height % 2 != 0) {
-            return Err(fdo::Error::InvalidArgs(format!("bad size {width}x{height}")));
+    async fn mirror_sized(
+        &self,
+        id: String,
+        source: String,
+        width: u32,
+        height: u32,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        if (width, height) != (0, 0)
+            && (!(320..=7680).contains(&width)
+                || !(240..=4320).contains(&height)
+                || width % 2 != 0
+                || height % 2 != 0)
+        {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "bad size {width}x{height}"
+            )));
         }
         if !self.st.lock().await.conns.contains_key(&id) {
             self.connect(id.clone(), conn).await?;
@@ -148,19 +205,29 @@ impl Luch {
 
     /// Capture sources usable on this machine, best first (`fast`, `fast169`, `virtual`, `monitor`, `window`).
     async fn sources(&self) -> Vec<String> {
-        mirror::available_sources().into_iter().map(String::from).collect()
+        mirror::available_sources()
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 
     /// The receiver's last `welcome` as JSON (decoders, `hw.display.modes`, `bench`), "{}" until
     /// the control channel has been opened once. Does not connect by itself.
     async fn capabilities(&self, id: String) -> String {
-        self.st.lock().await.welcomes.get(&id).map(|w| w.to_string()).unwrap_or_else(|| "{}".into())
+        self.st
+            .lock()
+            .await
+            .welcomes
+            .get(&id)
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "{}".into())
     }
 
     /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.
     async fn stats(&self, id: String) -> String {
         let s = self.st.lock().await.stats.get(&id).cloned();
-        s.map(|s| s.lock().unwrap().to_string()).unwrap_or_else(|| "{}".into())
+        s.map(|s| s.lock().unwrap().to_string())
+            .unwrap_or_else(|| "{}".into())
     }
 
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
@@ -193,7 +260,9 @@ impl Luch {
     /// WebCodecs — a TV will do — and it becomes a receiver. Empty with no default route.
     #[zbus(property)]
     async fn web_url(&self) -> String {
-        lan_ip().map(|ip| format!("https://{ip}:{}/", p::WEB_PORT)).unwrap_or_default()
+        lan_ip()
+            .map(|ip| format!("https://{ip}:{}/", p::WEB_PORT))
+            .unwrap_or_default()
     }
 
     #[zbus(signal)]
@@ -213,14 +282,22 @@ type Reader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 /// One JSON line, at most MAX_LINE bytes. Ok(None) on EOF.
 async fn read_msg(rd: &mut Reader) -> io::Result<Option<Value>> {
     let mut buf = Vec::new();
-    let n = (&mut *rd).take(p::MAX_LINE as u64 + 1).read_until(b'\n', &mut buf).await?;
+    let n = (&mut *rd)
+        .take(p::MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .await?;
     if n == 0 {
         return Ok(None);
     }
     if buf.last() != Some(&b'\n') {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long or truncated"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "line too long or truncated",
+        ));
     }
-    serde_json::from_slice(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 async fn send(wr: &mut OwnedWriteHalf, v: &Value) -> io::Result<()> {
@@ -231,7 +308,11 @@ async fn send(wr: &mut OwnedWriteHalf, v: &Value) -> io::Result<()> {
 
 /// Socket pinned to the interface the receiver was discovered on: the default
 /// route may be a full-tunnel VPN, so it must never decide where this goes.
-async fn handshake(r: &Receiver, id: &str, host: &str) -> io::Result<(Value, Reader, OwnedWriteHalf)> {
+async fn handshake(
+    r: &Receiver,
+    id: &str,
+    host: &str,
+) -> io::Result<(Value, Reader, OwnedWriteHalf)> {
     let addr: SocketAddr = format!("{}:{}", r.address, r.port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -250,7 +331,10 @@ async fn handshake(r: &Receiver, id: &str, host: &str) -> io::Result<(Value, Rea
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome"))??
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed before welcome"))?;
     if welcome["t"] != "welcome" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected welcome, got {welcome}")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected welcome, got {welcome}"),
+        ));
     }
     Ok((welcome, rd, wr))
 }
@@ -276,7 +360,9 @@ async fn run_channel(
                     }
                 }
                 Ok(None) => break,
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => eprintln!("[luchd] bad line: {e}"),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    eprintln!("[luchd] bad line: {e}")
+                }
                 Err(_) => break,
             }
         }
@@ -350,7 +436,13 @@ async fn run_channel(
 // ---------- mirroring ----------
 
 /// Body of the D-Bus `Mirror` method and of the web receiver's auto-start: one session to `id`.
-async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, requested: (u32, u32)) -> fdo::Result<()> {
+async fn start_mirror(
+    st: &Shared,
+    conn: &Connection,
+    id: &str,
+    source: &str,
+    requested: (u32, u32),
+) -> fdo::Result<()> {
     let mirror169 = source == "fast169";
     let kms = source == "fast" || mirror169;
     let niri_virtual = source == "virtual" && mirror::niri_virtual_available();
@@ -358,28 +450,66 @@ async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, re
         "" | "monitor" | "fast" | "fast169" => ashpd::desktop::screencast::SourceType::MONITOR,
         "window" => ashpd::desktop::screencast::SourceType::WINDOW,
         "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
-        s => return Err(fdo::Error::InvalidArgs(format!("source must be fast|monitor|window|virtual, not {s}"))),
+        s => {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "source must be fast|monitor|window|virtual, not {s}"
+            )))
+        }
     };
     if st.lock().await.mirrors.contains_key(id) {
         return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
     }
     let (c, r, welcome) = {
         let s = st.lock().await;
-        (s.conns.get(id).cloned(), s.found.get(id).cloned(), s.welcomes.get(id).cloned().unwrap_or(Value::Null))
+        (
+            s.conns.get(id).cloned(),
+            s.found.get(id).cloned(),
+            s.welcomes.get(id).cloned().unwrap_or(Value::Null),
+        )
     };
-    let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
-    let prefer = welcome["bench"]["prefer"].as_str().unwrap_or("video/avc").to_string();
+    let (c, r) = c
+        .zip(r)
+        .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+    let prefer = welcome["bench"]["prefer"]
+        .as_str()
+        .unwrap_or("video/avc")
+        .to_string();
     let size = if requested != (0, 0) {
-        display::Size { width: requested.0, height: requested.1 }
-    } else if std::env::var("LUCH_SIZE").ok().is_some_and(|v| !v.trim().is_empty()) {
-        let (width, height) = mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), welcome["max"].as_str());
+        display::Size {
+            width: requested.0,
+            height: requested.1,
+        }
+    } else if std::env::var("LUCH_SIZE")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        let (width, height) = mirror::session_size(
+            std::env::var("LUCH_SIZE").ok().as_deref(),
+            welcome["max"].as_str(),
+        );
         display::Size { width, height }
     } else if source == ashpd::desktop::screencast::SourceType::VIRTUAL {
         display::native_size(&welcome).unwrap_or_default()
-    } else { display::Size::default() };
+    } else {
+        display::Size::default()
+    };
     let ws = c.media.clone();
-    let address = r.address.parse().map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-    let target = mirror::Target { name: r.name.clone(), address, ifname: r.ifname.clone(), source, kms, prefer, ws, size, niri_virtual, mirror169 };
+    let address = r
+        .address
+        .parse()
+        .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
+    let target = mirror::Target {
+        name: r.name.clone(),
+        address,
+        ifname: r.ifname.clone(),
+        source,
+        kms,
+        prefer,
+        ws,
+        size,
+        niri_virtual,
+        mirror169,
+    };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
     {
@@ -391,7 +521,11 @@ async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, re
     let (st, conn, id) = (st.clone(), conn.clone(), id.to_string());
     // Subscribe here and drop our copy of the sender: the mirror must see the channel close
     // (receiver gone or restarted) instead of streaming into the void.
-    let Conn { cmd, events, media: _ } = c;
+    let Conn {
+        cmd,
+        events,
+        media: _,
+    } = c;
     let events_rx = events.subscribe();
     drop(events);
     let name = target.name.clone();
@@ -425,8 +559,10 @@ fn lan_ip() -> Option<std::net::IpAddr> {
 }
 
 async fn serve_web(st: Shared, dbus: Connection, sender_id: String, host: String) {
-    let mut identity = match config_dir().map_err(Box::<dyn Error>::from)
-        .and_then(|dir| web_tls::Identity::load(&dir, lan_ip())) {
+    let mut identity = match config_dir()
+        .map_err(Box::<dyn Error>::from)
+        .and_then(|dir| web_tls::Identity::load(&dir, lan_ip()))
+    {
         Ok(identity) => identity,
         Err(e) => return eprintln!("[luchd] web receiver off: TLS identity: {e}"),
     };
@@ -434,13 +570,23 @@ async fn serve_web(st: Shared, dbus: Connection, sender_id: String, host: String
         Ok(l) => l,
         Err(e) => return eprintln!("[luchd] web receiver off: cannot bind {}: {e}", p::WEB_PORT),
     };
-    eprintln!("[luchd] web receiver at https://<this host>:{}/ (local self-signed certificate)", p::WEB_PORT);
+    eprintln!(
+        "[luchd] web receiver at https://<this host>:{}/ (local self-signed certificate)",
+        p::WEB_PORT
+    );
     loop {
-        let Ok((mut stream, peer)) = l.accept().await else { continue };
-        let Ok(local) = stream.local_addr() else { continue };
+        let Ok((mut stream, peer)) = l.accept().await else {
+            continue;
+        };
+        let Ok(local) = stream.local_addr() else {
+            continue;
+        };
         let acceptor = match identity.for_ip(local.ip()) {
             Ok(a) => a,
-            Err(e) => { eprintln!("[luchd] web TLS: {e}"); continue; }
+            Err(e) => {
+                eprintln!("[luchd] web TLS: {e}");
+                continue;
+            }
         };
         let (st, dbus, sid, host) = (st.clone(), dbus.clone(), sender_id.clone(), host.clone());
         tokio::spawn(async move {
@@ -477,15 +623,22 @@ async fn web_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     sender_id: String,
     host: String,
 ) -> io::Result<()> {
-    let head = timeout(HANDSHAKE_TIMEOUT, read_http_head(&mut stream)).await
+    let head = timeout(HANDSHAKE_TIMEOUT, read_http_head(&mut stream))
+        .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP header timeout"))??;
     let text = String::from_utf8_lossy(&head);
     let first = text.split("\r\n").next().unwrap_or_default().to_string();
     let path = first.split(' ').nth(1).unwrap_or_default().to_string();
-    if text.to_ascii_lowercase().contains("upgrade: websocket") && path.split('?').next() == Some("/ws") {
+    if text.to_ascii_lowercase().contains("upgrade: websocket")
+        && path.split('?').next() == Some("/ws")
+    {
         // Replay the consumed header so tungstenite validates the entire upgrade request.
-        let stream = Prefixed { inner: std::io::Cursor::new(head).chain(stream) };
-        let ws = accept_async(stream).await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let stream = Prefixed {
+            inner: std::io::Cursor::new(head).chain(stream),
+        };
+        let ws = accept_async(stream)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         return run_web(ws, peer, st, dbus, sender_id, host).await;
     }
     // Any GET (not just /) serves the page: TV browsers append or mangle paths.
@@ -504,7 +657,10 @@ async fn read_http_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<
     let mut head = Vec::with_capacity(512);
     loop {
         if head.len() == 8192 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "HTTP header too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP header too large",
+            ));
         }
         head.push(stream.read_u8().await?);
         if head.ends_with(b"\r\n\r\n") {
@@ -514,33 +670,61 @@ async fn read_http_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<
 }
 
 /// Read the already consumed HTTP header before continuing with the underlying TCP/TLS stream.
-struct Prefixed<S> { inner: tokio::io::Chain<std::io::Cursor<Vec<u8>>, S> }
+struct Prefixed<S> {
+    inner: tokio::io::Chain<std::io::Cursor<Vec<u8>>, S>,
+}
 
 impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
-    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
         std::pin::Pin::new(self.inner.get_mut().1).poll_write(cx, buf)
     }
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
         std::pin::Pin::new(self.inner.get_mut().1).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
         std::pin::Pin::new(self.inner.get_mut().1).poll_shutdown(cx)
     }
 }
 
 /// A web receiver: hello/welcome over the websocket, then it behaves like any other receiver
 /// (start/ready, keyframe, pings); media goes back over the same socket as binary frames.
-async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(ws: WebSocketStream<S>, peer: SocketAddr, st: Shared, dbus: Connection, sender_id: String, host: String) -> io::Result<()> {
+async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    ws: WebSocketStream<S>,
+    peer: SocketAddr,
+    st: Shared,
+    dbus: Connection,
+    sender_id: String,
+    host: String,
+) -> io::Result<()> {
     let (sink, mut stream) = ws.split();
     let hello = match timeout(HANDSHAKE_TIMEOUT, stream.next()).await {
-        Ok(Some(Ok(Message::Text(s)))) => serde_json::from_str::<Value>(s.as_str()).unwrap_or(Value::Null),
+        Ok(Some(Ok(Message::Text(s)))) => {
+            serde_json::from_str::<Value>(s.as_str()).unwrap_or(Value::Null)
+        }
         Err(_) => {
-            eprintln!("[luchd] web {peer}: no hello in {} s", HANDSHAKE_TIMEOUT.as_secs());
+            eprintln!(
+                "[luchd] web {peer}: no hello in {} s",
+                HANDSHAKE_TIMEOUT.as_secs()
+            );
             return Ok(());
         }
         _ => return Ok(()), // a non-text first message: just drop it
@@ -574,7 +758,14 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(ws: WebSock
             },
         );
         s.welcomes.insert(id.clone(), welcome.clone());
-        s.conns.insert(id.clone(), Conn { cmd: cmd_tx.clone(), events: events.clone(), media: Some(media_tx) });
+        s.conns.insert(
+            id.clone(),
+            Conn {
+                cmd: cmd_tx.clone(),
+                events: events.clone(),
+                media: Some(media_tx),
+            },
+        );
     }
     eprintln!("[luchd] web receiver: {name} ({peer})");
     changed(&dbus).await;
@@ -614,7 +805,9 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(ws: WebSock
                     }
                 }
                 // Media flows one way; protocol-level pings are answered by tungstenite itself.
-                Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(
+                    Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_),
+                )) => {}
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
             }
         }
@@ -623,7 +816,9 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(ws: WebSock
     // One tap on the TV starts the whole thing; `?mode=none` keeps it manual.
     if mode != "none" {
         if let Err(e) = start_mirror(&st, &dbus, &id, &mode, (0, 0)).await {
-            let _ = cmd_tx.send(Cmd::Send(json!({"t": "error", "msg": e.to_string()}))).await;
+            let _ = cmd_tx
+                .send(Cmd::Send(json!({"t": "error", "msg": e.to_string()})))
+                .await;
         }
     }
 
@@ -698,12 +893,15 @@ fn ifname(index: i32) -> String {
         return String::new();
     }
     // SAFETY: on success the buffer holds a NUL-terminated name.
-    unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// tun/wg/ppp: point-to-point links (IFF_POINTOPOINT = 0x10).
 fn is_tunnel(ifname: &str) -> bool {
-    let flags = std::fs::read_to_string(format!("/sys/class/net/{ifname}/flags")).unwrap_or_default();
+    let flags =
+        std::fs::read_to_string(format!("/sys/class/net/{ifname}/flags")).unwrap_or_default();
     u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).is_ok_and(|f| f & 0x10 != 0)
 }
 
@@ -736,29 +934,72 @@ async fn publish(sys: &Connection, id: &str, host: &str) -> zbus::Result<OwnedOb
         .await?
         .body()
         .deserialize()?;
-    let txt: Vec<Vec<u8>> = [format!("v={}", p::VERSION), format!("id={id}"), format!("name={host}")]
-        .into_iter()
-        .map(String::into_bytes)
-        .collect();
+    let txt: Vec<Vec<u8>> = [
+        format!("v={}", p::VERSION),
+        format!("id={id}"),
+        format!("name={host}"),
+    ]
+    .into_iter()
+    .map(String::into_bytes)
+    .collect();
     let eg = Some("org.freedesktop.Avahi.EntryGroup");
     // The sender listens on nothing yet; port 9 (discard) is a placeholder, the TXT is what matters.
-    let args = (AVAHI_IF_UNSPEC, AVAHI_PROTO_INET, 0u32, host, p::SENDER_TYPE, "", "", 9u16, txt);
-    sys.call_method(Some(AVAHI), &group, eg, "AddService", &args).await?;
-    sys.call_method(Some(AVAHI), &group, eg, "Commit", &()).await?;
+    let args = (
+        AVAHI_IF_UNSPEC,
+        AVAHI_PROTO_INET,
+        0u32,
+        host,
+        p::SENDER_TYPE,
+        "",
+        "",
+        9u16,
+        txt,
+    );
+    sys.call_method(Some(AVAHI), &group, eg, "AddService", &args)
+        .await?;
+    sys.call_method(Some(AVAHI), &group, eg, "Commit", &())
+        .await?;
     Ok(group)
 }
 
-async fn resolve(sys: &Connection, iface: i32, proto: i32, name: &str, ty: &str, domain: &str) -> zbus::Result<Option<Receiver>> {
+async fn resolve(
+    sys: &Connection,
+    iface: i32,
+    proto: i32,
+    name: &str,
+    ty: &str,
+    domain: &str,
+) -> zbus::Result<Option<Receiver>> {
     let args = (iface, proto, name, ty, domain, AVAHI_PROTO_INET, 0u32);
-    let reply = sys.call_method(Some(AVAHI), "/", Some(AVAHI_SERVER), "ResolveService", &args).await?;
+    let reply = sys
+        .call_method(
+            Some(AVAHI),
+            "/",
+            Some(AVAHI_SERVER),
+            "ResolveService",
+            &args,
+        )
+        .await?;
     let (ifindex, _, service, _, _, _host, _, address, port, txt, _): (
-        i32, i32, String, String, String, String, i32, String, u16, Vec<Vec<u8>>, u32,
+        i32,
+        i32,
+        String,
+        String,
+        String,
+        String,
+        i32,
+        String,
+        u16,
+        Vec<Vec<u8>>,
+        u32,
     ) = reply.body().deserialize()?;
     let t = txt_map(&txt);
     if t.get("v").is_some_and(|v| v != "0") {
         return Ok(None);
     }
-    let Some(id) = t.get("id").cloned() else { return Ok(None) };
+    let Some(id) = t.get("id").cloned() else {
+        return Ok(None);
+    };
     Ok(Some(Receiver {
         name: t.get("name").cloned().unwrap_or_else(|| service.clone()),
         model: t.get("model").cloned().unwrap_or_default(),
@@ -799,7 +1040,12 @@ fn sender_id() -> io::Result<String> {
 
 fn short_host() -> String {
     let h = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    h.trim().split('.').next().filter(|s| !s.is_empty()).unwrap_or("linux").to_string()
+    h.trim()
+        .split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("linux")
+        .to_string()
 }
 
 #[tokio::main]
@@ -822,11 +1068,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (discovery, worker) = discovery::Discovery::new();
     let conn = zbus::connection::Builder::session()?
         .name(p::DBUS_NAME)?
-        .serve_at(p::DBUS_PATH, Luch { st: st.clone(), sender_id: id.clone(), host: host.clone(), discovery })?
+        .serve_at(
+            p::DBUS_PATH,
+            Luch {
+                st: st.clone(),
+                sender_id: id.clone(),
+                host: host.clone(),
+                discovery,
+            },
+        )?
         .build()
         .await?;
-    eprintln!("[luchd] {} id={id} name={host}; browsing {}", p::APP, p::RECEIVER_TYPE);
-    tokio::spawn(serve_web(st.clone(), conn.clone(), id.clone(), host.clone()));
+    eprintln!(
+        "[luchd] {} id={id} name={host}; browsing {}",
+        p::APP,
+        p::RECEIVER_TYPE
+    );
+    tokio::spawn(serve_web(
+        st.clone(),
+        conn.clone(),
+        id.clone(),
+        host.clone(),
+    ));
     worker.run(sys, st, conn).await?;
     Err("avahi browse stream ended".into())
 }
@@ -837,7 +1100,12 @@ mod tests {
 
     #[test]
     fn txt_parses_and_lowercases_keys() {
-        let t = txt_map(&[b"v=0".to_vec(), b"ID=abc".to_vec(), b"dec=avc,hevc".to_vec(), b"junk".to_vec()]);
+        let t = txt_map(&[
+            b"v=0".to_vec(),
+            b"ID=abc".to_vec(),
+            b"dec=avc,hevc".to_vec(),
+            b"junk".to_vec(),
+        ]);
         assert_eq!(t["v"], "0");
         assert_eq!(t["id"], "abc");
         assert_eq!(t["dec"], "avc,hevc");
@@ -846,15 +1114,25 @@ mod tests {
 
     #[tokio::test]
     async fn local_https_identity_persists_and_carries_websocket_media() {
-        use tokio_rustls::rustls::{self, pki_types::{pem::PemObject, CertificateDer, ServerName}};
         use std::os::unix::fs::PermissionsExt;
+        use tokio_rustls::rustls::{
+            self,
+            pki_types::{pem::PemObject, CertificateDer, ServerName},
+        };
         let dir = std::env::temp_dir().join(format!("luch-tls-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         let ip = "127.0.0.1".parse().unwrap();
         drop(web_tls::Identity::load(&dir, Some(ip)).unwrap());
         let original = std::fs::read(dir.join("web-cert.pem")).unwrap();
         let key = std::fs::read(dir.join("web-key.pem")).unwrap();
-        assert_eq!(std::fs::metadata(dir.join("web-key.pem")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(dir.join("web-key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let mut identity = web_tls::Identity::load(&dir, Some(ip)).unwrap();
         assert_eq!(original, std::fs::read(dir.join("web-cert.pem")).unwrap());
         identity.for_ip("192.0.2.1".parse().unwrap()).unwrap();
@@ -865,8 +1143,13 @@ mod tests {
         let cert = CertificateDer::from_pem_file(dir.join("web-cert.pem")).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
-        let config = rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-            .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -874,18 +1157,37 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut tls = identity.acceptor.accept(stream).await.unwrap();
             let head = read_http_head(&mut tls).await.unwrap();
-            let mut ws = accept_async(Prefixed { inner: std::io::Cursor::new(head).chain(tls) }).await.unwrap();
+            let mut ws = accept_async(Prefixed {
+                inner: std::io::Cursor::new(head).chain(tls),
+            })
+            .await
+            .unwrap();
             let ready = ws.next().await.unwrap().unwrap();
             assert_eq!(ready, Message::Text("{\"t\":\"ready\"}".into()));
-            ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
+            ws.send(Message::Binary(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         // Verify a new LAN IP SAN as well as trust, without disabling certificate validation.
-        let tls = connector.connect(ServerName::IpAddress("192.0.2.1".parse::<std::net::IpAddr>().unwrap().into()), stream).await.unwrap();
-        let (mut ws, response) = tokio_tungstenite::client_async(format!("wss://{addr}/ws"), tls).await.unwrap();
+        let tls = connector
+            .connect(
+                ServerName::IpAddress("192.0.2.1".parse::<std::net::IpAddr>().unwrap().into()),
+                stream,
+            )
+            .await
+            .unwrap();
+        let (mut ws, response) = tokio_tungstenite::client_async(format!("wss://{addr}/ws"), tls)
+            .await
+            .unwrap();
         assert_eq!(response.status(), 101);
-        ws.send(Message::Text("{\"t\":\"ready\"}".into())).await.unwrap();
-        assert_eq!(ws.next().await.unwrap().unwrap(), Message::Binary(vec![1, 2, 3].into()));
+        ws.send(Message::Text("{\"t\":\"ready\"}".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Binary(vec![1, 2, 3].into())
+        );
         task.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -893,13 +1195,22 @@ mod tests {
     #[tokio::test]
     async fn fragmented_http_header_preserves_websocket_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         let request = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
         let task = tokio::spawn(async move {
-            let head = timeout(Duration::from_secs(2), read_http_head(&mut server)).await.unwrap().unwrap();
+            let head = timeout(Duration::from_secs(2), read_http_head(&mut server))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(head, request);
-            accept_async(Prefixed { inner: std::io::Cursor::new(head).chain(server) }).await.unwrap()
+            accept_async(Prefixed {
+                inner: std::io::Cursor::new(head).chain(server),
+            })
+            .await
+            .unwrap()
         });
         // Keep the initial prefix pending long enough to expose repeated-peek duplication.
         client.write_all(&request[..20]).await.unwrap();
@@ -913,21 +1224,41 @@ mod tests {
         let response = read_http_head(&mut client).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 101 "));
         let mut client = WebSocketStream::from_raw_socket(
-            client, tokio_tungstenite::tungstenite::protocol::Role::Client, None,
-        ).await;
-        server.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
-        assert_eq!(client.next().await.unwrap().unwrap(), Message::Binary(vec![1, 2, 3].into()));
-        client.send(Message::Text("{\"t\":\"ready\"}".into())).await.unwrap();
-        assert_eq!(server.next().await.unwrap().unwrap(), Message::Text("{\"t\":\"ready\"}".into()));
+            client,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        server
+            .send(Message::Binary(vec![1, 2, 3].into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Message::Binary(vec![1, 2, 3].into())
+        );
+        client
+            .send(Message::Text("{\"t\":\"ready\"}".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Text("{\"t\":\"ready\"}".into())
+        );
     }
 
     #[tokio::test]
     async fn oversized_http_header_is_rejected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         client.write_all(&vec![b'x'; 8193]).await.unwrap();
-        let err = timeout(Duration::from_secs(2), read_http_head(&mut server)).await.unwrap().unwrap_err();
+        let err = timeout(Duration::from_secs(2), read_http_head(&mut server))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
