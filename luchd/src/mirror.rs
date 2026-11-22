@@ -162,14 +162,16 @@ async fn switch_to_16x9(want_w: u32) -> Option<ModeGuard> {
 
 /// A headless Niri output created for one session, and the Mutter-compatible ScreenCast session on it.
 struct NiriVirtual {
-    name: String,
+    _output: VirtualOutput,
     session: zbus::Proxy<'static>,
     node: u32,
 }
 
-impl Drop for NiriVirtual {
+struct VirtualOutput(String);
+
+impl Drop for VirtualOutput {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("niri-virtual").args(["msg", "remove-virtual-output", &self.name]).output();
+        let _ = std::process::Command::new("niri-virtual").args(["msg", "remove-virtual-output", &self.0]).output();
     }
 }
 
@@ -344,7 +346,8 @@ async fn niri_virtual(name: &str, (w, h): (u32, u32)) -> Result<NiriVirtual, Str
     if !out.status.success() {
         return Err(format!("niri-virtual: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
-    // From here on the output must go away on any error, so wrap it before the fallible calls.
+    let output = VirtualOutput(name.to_string());
+    // The guard removes the output on every failure below.
     let e = |e: zbus::Error| format!("niri screencast: {e}");
     let conn = zbus::Connection::session().await.map_err(e)?;
     const DEST: &str = "org.gnome.Mutter.ScreenCast";
@@ -363,7 +366,7 @@ async fn niri_virtual(name: &str, (w, h): (u32, u32)) -> Result<NiriVirtual, Str
         .map_err(|_| "niri screencast: no stream".to_string())?
         .ok_or("niri screencast: closed")?;
     let node: u32 = msg.body().deserialize().map_err(|e| format!("niri screencast: {e}"))?;
-    Ok(NiriVirtual { name: name.to_string(), session, node })
+    Ok(NiriVirtual { _output: output, session, node })
 }
 
 /// Holds the screen awake (org.freedesktop.ScreenSaver, as KDE, GNOME and Steam answer it) while a session

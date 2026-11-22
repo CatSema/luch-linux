@@ -98,10 +98,11 @@ Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirr
 While a session runs, `luchd` holds `org.freedesktop.ScreenSaver.Inhibit` (KDE, GNOME and Steam answer it), so the
 screen does not go to sleep under the stream: a sleeping screen has nothing to capture. Nothing happens where nothing
 answers that interface.
+
 ### `MirrorSized(s id, s source, u width, u height)`
 
 Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x4320). `Mirror` is
-`MirrorSized` with 0x0, which means the default size (`LUCH_SIZE`, else 1920x1080). The video bitrate grows with the square root of the pixel count (4K gets
+`MirrorSized` with 0x0, which means the default size (`LUCH_SIZE` when set; otherwise the receiver’s native display size for `virtual`, 1920x1080 for other modes). The video bitrate grows with the square root of the pixel count (4K gets
 twice the 1080p rate). The sizes a receiver can show are in `welcome.hw.display.modes` and
 `welcome.hw.video`; a receiver's decoder may not keep up with 4K at 60 fps, so check `Stats`.
 
