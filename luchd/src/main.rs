@@ -133,10 +133,28 @@ impl Luch {
     /// screencast portal: its picker is shown the first time, later runs reuse a saved token.
     /// Returns once the session is set up; it then runs until StopMirror or the receiver stops it.
     async fn mirror(&self, id: String, source: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        self.mirror_sized(id, source, 0, 0, conn).await
+    }
+
+    async fn mirror_sized(&self, id: String, source: String, width: u32, height: u32, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        if (width, height) != (0, 0) && (!(320..=7680).contains(&width) || !(240..=4320).contains(&height) || width % 2 != 0 || height % 2 != 0) {
+            return Err(fdo::Error::InvalidArgs(format!("bad size {width}x{height}")));
+        }
         if !self.st.lock().await.conns.contains_key(&id) {
             self.connect(id.clone(), conn).await?;
         }
-        start_mirror(&self.st, conn, &id, &source).await
+        start_mirror(&self.st, conn, &id, &source, (width, height)).await
+    }
+
+    /// Capture sources usable on this machine, best first (`fast`, `monitor`, `window`, `virtual`).
+    async fn sources(&self) -> Vec<String> {
+        mirror::available_sources().into_iter().map(String::from).collect()
+    }
+
+    /// The receiver's last `welcome` as JSON (decoders, `hw.display.modes`, `bench`), "{}" until
+    /// the control channel has been opened once. Does not connect by itself.
+    async fn capabilities(&self, id: String) -> String {
+        self.st.lock().await.welcomes.get(&id).map(|w| w.to_string()).unwrap_or_else(|| "{}".into())
     }
 
     /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.
@@ -318,7 +336,7 @@ async fn run_channel(
 // ---------- mirroring ----------
 
 /// Body of the D-Bus `Mirror` method and of the web receiver's auto-start: one session to `id`.
-async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str) -> fdo::Result<()> {
+async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str, requested: (u32, u32)) -> fdo::Result<()> {
     let kms = source == "fast";
     let source = match source {
         "" | "monitor" | "fast" => ashpd::desktop::screencast::SourceType::MONITOR,
@@ -335,7 +353,12 @@ async fn start_mirror(st: &Shared, conn: &Connection, id: &str, source: &str) ->
     };
     let (c, r) = c.zip(r).ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
     let prefer = welcome["bench"]["prefer"].as_str().unwrap_or("video/avc").to_string();
-    let size = if source == ashpd::desktop::screencast::SourceType::VIRTUAL {
+    let size = if requested != (0, 0) {
+        display::Size { width: requested.0, height: requested.1 }
+    } else if std::env::var("LUCH_SIZE").ok().is_some_and(|v| !v.trim().is_empty()) {
+        let (width, height) = mirror::session_size(std::env::var("LUCH_SIZE").ok().as_deref(), welcome["max"].as_str());
+        display::Size { width, height }
+    } else if source == ashpd::desktop::screencast::SourceType::VIRTUAL {
         display::native_size(&welcome).unwrap_or_default()
     } else { display::Size::default() };
     let ws = c.media.clone();
@@ -583,7 +606,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(ws: WebSock
 
     // One tap on the TV starts the whole thing; `?mode=none` keeps it manual.
     if mode != "none" {
-        if let Err(e) = start_mirror(&st, &dbus, &id, &mode).await {
+        if let Err(e) = start_mirror(&st, &dbus, &id, &mode, (0, 0)).await {
             let _ = cmd_tx.send(Cmd::Send(json!({"t": "error", "msg": e.to_string()}))).await;
         }
     }
