@@ -315,7 +315,7 @@ pub fn available_sources() -> Vec<&'static str> {
     };
     let niri = std::env::var_os("NIRI_SOCKET").is_some() && on_path("niri");
     let mut v = Vec::new();
-    if on_path("luch-kms") {
+    if on_path("luch-kms") || kms_socket().is_some() {
         v.push("fast");
         if niri {
             v.push("fast169");
@@ -682,21 +682,70 @@ fn wire(p: &gst::Pipeline, video: Arc<Tx>, audio: Arc<Tx>, want_idr: Arc<AtomicB
     need_head
 }
 
-/// Lowest-latency video: spawns luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) and forwards its
-/// packets as they come. Returns the child; write b"k" to its stdin to force an IDR.
-fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: Size) -> Result<std::process::Child, String> {
-    use std::io::Read;
+/// Where a privileged `luch-kms --serve` listens, when there is one (env `LUCH_KMS_SOCKET`, else
+/// `$XDG_RUNTIME_DIR/luch/kms.sock`): used by a luchd that cannot run luch-kms itself (a Flatpak sandbox).
+pub fn kms_socket() -> Option<std::path::PathBuf> {
+    let p = std::env::var_os("LUCH_KMS_SOCKET")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|d| std::path::PathBuf::from(d).join("luch/kms.sock")))?;
+    p.exists().then_some(p)
+}
+
+/// The KMS grabber: a child process, or a connection to a `luch-kms --serve`.
+enum Grabber {
+    Child(std::process::Child),
+    Socket(std::os::unix::net::UnixStream),
+}
+
+impl Grabber {
+    /// Ask for an IDR.
+    fn idr(&mut self) {
+        use std::io::Write;
+        let _ = match self {
+            Grabber::Child(c) => c.stdin.as_mut().map(|s| s.write_all(b"k")).unwrap_or(Ok(())),
+            Grabber::Socket(s) => s.write_all(b"k"),
+        };
+    }
+
+    fn stop(self) {
+        match self {
+            Grabber::Child(mut c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            Grabber::Socket(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Lowest-latency video: luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) as a child, or through its
+/// socket, forwarding its packets as they come. `k` on its input forces an IDR.
+fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: Size) -> Result<Grabber, String> {
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
-    let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
-    let mut child = Command::new(&exe)
-        .args(["--size", &format!("{}x{}", size.width, size.height), "--fps", &FPS.to_string(), "--kbps", &kbps_for(size.width, size.height).to_string()])
-        .args(["--codec", if hevc { "hevc" } else { "h264" }])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", exe.display()))?;
-    let mut out = child.stdout.take().unwrap();
+    let kbps = kbps_for(size.width, size.height);
+    let opts = format!("--size {}x{} --fps {FPS} --kbps {kbps} --codec {}", size.width, size.height, if hevc { "hevc" } else { "h264" });
+    let (grabber, mut out): (Grabber, Box<dyn Read + Send>) = match kms_socket().and_then(|p| std::os::unix::net::UnixStream::connect(p).ok()) {
+        Some(mut s) => {
+            writeln!(s, "{opts}").map_err(|e| format!("luch-kms socket: {e}"))?;
+            let out = s.try_clone().map_err(|e| format!("luch-kms socket: {e}"))?;
+            (Grabber::Socket(s), Box::new(out))
+        }
+        None => {
+            let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("luch-kms")));
+            let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "luch-kms".into());
+            let mut child = Command::new(&exe)
+                .args(opts.split(' '))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("{}: {e}", exe.display()))?;
+            let out = child.stdout.take().unwrap();
+            (Grabber::Child(child), Box::new(out))
+        }
+    };
     std::thread::spawn(move || {
         let mut hdr = [0u8; 13];
         let mut buf = Vec::new();
@@ -718,7 +767,7 @@ fn spawn_kms(video: Arc<Tx>, need_head: Arc<AtomicBool>, hevc: bool, size: Size)
             video.send_frame(&buf, if idr { F_IDR } else { 0 }, cap - base, lat);
         }
     });
-    Ok(child)
+    Ok(grabber)
 }
 
 fn mono_us() -> u64 {
@@ -871,9 +920,8 @@ pub async fn run(
             ev = events.recv() => match ev {
                 Ok(v) if v["t"] == "keyframe" => {
                     want_idr.store(true, Ordering::Relaxed);
-                    if let Some(k) = kms.as_mut().and_then(|k| k.stdin.as_mut()) {
-                        use std::io::Write;
-                        let _ = k.write_all(b"k");
+                    if let Some(k) = kms.as_mut() {
+                        k.idr();
                     }
                 }
                 Ok(v) if v["t"] == "stats" => rx_stats = v,
@@ -896,9 +944,8 @@ pub async fn run(
         }
     };
     let _ = p.set_state(gst::State::Null);
-    if let Some(mut k) = kms {
-        let _ = k.kill();
-        let _ = k.wait();
+    if let Some(k) = kms {
+        k.stop();
     }
     if let Some(n) = nv {
         let _ = n.session.call::<_, _, ()>("Stop", &()).await;

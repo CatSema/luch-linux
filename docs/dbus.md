@@ -207,5 +207,6 @@ proxy.connectSignal('ReceiversChanged', () => { /* refresh */ });
 |-----------------|---------|
 | `~/.config/luch/id` | sender id |
 | `~/.config/luch/restore-token` | screencast portal restore token (no picker after the first time) |
+| `LUCH_KMS_SOCKET` | a privileged `luch-kms --serve SOCKET [--uid N]` that `luchd` uses for the `fast` mode instead of running `luch-kms` itself (default `$XDG_RUNTIME_DIR/luch/kms.sock`, used when it exists): for a `luchd` in a sandbox (Flatpak), where file capabilities do not work. The socket is owned by `--uid`, mode 0600 |
 | `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM card and render node for `luch-kms` (default `/dev/dri/card1`, `/dev/dri/renderD128`) |
 | `LUCH_PROBE=1` | per-stage latency probes in the `luchd` log |
