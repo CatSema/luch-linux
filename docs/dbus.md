@@ -95,6 +95,9 @@ GNOME 50 still labels portal-created monitors `MetaVendor`: its API has no displ
 
 Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirroring.
 
+While a session runs, `luchd` holds `org.freedesktop.ScreenSaver.Inhibit` (KDE, GNOME and Steam answer it), so the
+screen does not go to sleep under the stream: a sleeping screen has nothing to capture. Nothing happens where nothing
+answers that interface.
 ### `MirrorSized(s id, s source, u width, u height)`
 
 Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x4320). `Mirror` is

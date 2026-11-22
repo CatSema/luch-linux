@@ -366,6 +366,35 @@ async fn niri_virtual(name: &str, (w, h): (u32, u32)) -> Result<NiriVirtual, Str
     Ok(NiriVirtual { name: name.to_string(), session, node })
 }
 
+/// Holds the screen awake (org.freedesktop.ScreenSaver, as KDE, GNOME and Steam answer it) while a session
+/// runs: a screen that goes to sleep has nothing to capture.
+struct ScreenAwake(Option<(zbus::Connection, String, u32)>);
+
+impl ScreenAwake {
+    async fn start() -> Self {
+        let Ok(conn) = zbus::Connection::session().await else { return ScreenAwake(None) };
+        for path in ["/org/freedesktop/ScreenSaver", "/ScreenSaver"] {
+            let Ok(p) = zbus::Proxy::new(&conn, "org.freedesktop.ScreenSaver", path, "org.freedesktop.ScreenSaver").await else { continue };
+            if let Ok(cookie) = p.call::<_, _, u32>("Inhibit", &("Luch", "Mirroring to a receiver")).await {
+                return ScreenAwake(Some((conn, path.to_string(), cookie)));
+            }
+        }
+        ScreenAwake(None)
+    }
+}
+
+impl Drop for ScreenAwake {
+    fn drop(&mut self) {
+        if let Some((conn, path, cookie)) = self.0.take() {
+            tokio::spawn(async move {
+                if let Ok(p) = zbus::Proxy::new(&conn, "org.freedesktop.ScreenSaver", path, "org.freedesktop.ScreenSaver").await {
+                    let _ = p.call::<_, _, ()>("UnInhibit", &(cookie,)).await;
+                }
+            });
+        }
+    }
+}
+
 /// Messages to the control-channel task.
 pub enum Cmd {
     Bye,
@@ -819,6 +848,7 @@ pub async fn run(
     mut stop: mpsc::Receiver<()>,
     stats: Stats,
 ) -> Result<&'static str, String> {
+    let _awake = ScreenAwake::start().await;
     let _mute = MuteSession::start();
     let size = t.size;
     let virtual_source = t.source == SourceType::VIRTUAL && !t.niri_virtual;
