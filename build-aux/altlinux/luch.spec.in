@@ -4,7 +4,7 @@ Release: alt@RELEASE@
 Summary: Low-latency Linux screen mirroring to Luch receivers (Android TV, projectors)
 License: GPL-3.0-or-later
 Group: Video
-Url: https://github.com/Toxblh/luch-linux
+Url: https://github.com/Luch-stream/luch-linux
 Source: %name-%version.tar
 
 BuildRequires: rpm-build-rust rust rust-cargo gcc pkg-config clang
@@ -19,6 +19,7 @@ Requires: pipewire
 Luch mirrors a Linux screen to an Android TV or a projector with game-streaming
 latency. luchd is the user daemon (D-Bus dev.luch.Luch1), luchctl is the command
 line front-end, luch-kms captures the KMS scanout for the lowest-latency mode.
+luch-recv is a receiver: it shows the screen of another sender in a window.
 
 %prep
 %setup
@@ -32,6 +33,7 @@ cargo build --release --offline --locked
 install -Dm755 target/release/luchd %buildroot%_bindir/luchd
 install -Dm755 target/release/luchctl %buildroot%_bindir/luchctl
 install -Dm755 target/release/luch-kms %buildroot%_bindir/luch-kms
+install -Dm755 target/release/luch-recv %buildroot%_bindir/luch-recv
 mkdir -p %buildroot%_userunitdir
 sed 's|%%h/.cargo/bin/luchd|%_bindir/luchd|' contrib/luchd.service > %buildroot%_userunitdir/luchd.service
 install -Dm644 /dev/stdin %buildroot%_prefix/lib/systemd/user-preset/90-luch.preset <<< 'enable luchd.service'
@@ -45,6 +47,7 @@ setcap cap_sys_admin+ep %_bindir/luch-kms || :
 %_bindir/luchd
 %_bindir/luchctl
 %_bindir/luch-kms
+%_bindir/luch-recv
 %_userunitdir/luchd.service
 %_prefix/lib/systemd/user-preset/90-luch.preset
 

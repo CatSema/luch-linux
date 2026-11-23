@@ -41,7 +41,7 @@ jobs:
         run: |
           name=luch-linux-${GITHUB_REF_NAME//\//-}-x86_64
           mkdir -p "$name/bin"
-          cp target/release/{luchd,luchctl,luch-kms} "$name/bin/"
+          cp target/release/{luchd,luchctl,luch-kms,luch-recv} "$name/bin/"
           cp -r contrib docs README.md README.ru.md LICENSE "$name/"
           (cd gnome-extension/luch@toxblh.github.io && zip -qr "$GITHUB_WORKSPACE/luch@toxblh.github.io.shell-extension.zip" .)
           cp "luch@toxblh.github.io.shell-extension.zip" "$name/"

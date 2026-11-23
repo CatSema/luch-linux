@@ -1,6 +1,6 @@
 [package]
 name = "luch-recv"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Luch receiver for Linux: shows a phone's (or any sender's) screen in a floating window"
