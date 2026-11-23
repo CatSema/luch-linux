@@ -131,9 +131,23 @@ luchctl mirror                            # fast mode; the receiver name is opti
 luchctl mirror "XGIMI MoGo 4 Laser" window # or monitor | window | virtual
 luchctl stats                             # live latency, fps, bitrate
 luchctl stop
+luchctl info                              # the receiver's Android and what works worse on it
+luchctl audio sync                        # sound: auto | on | off | sync (per receiver, remembered)
+luchctl reports                           # crash and error reports the receivers handed over
+luchctl report 1 open                     # file one as an issue (or: report 1, report 1 dismiss)
 ```
 
-**Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md).
+**Sound on older receivers.** Android 5 and 6 cannot make the receiver's sound short: it trails the picture by
+its audio buffer (`luchctl info` says how much). `auto`, the default, then holds the picture back to match
+(`sync`); `on` keeps the picture fastest and lets the sound lag; `off` sends the picture only. On Android 7 and
+later `auto` plays the sound as it comes, about 20 ms behind.
+
+**Crash reports.** A receiver keeps short reports of its crashes and errors (no logs, addresses or names) and hands
+them to luchd, which keeps them in `~/.config/luch/reports` and shows a notification: click it to open a filled-in
+issue for the receiver's project. Nothing is sent anywhere unless you file it.
+
+**Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md) (also `Info`,
+`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`).
 
 ## Troubleshooting
 

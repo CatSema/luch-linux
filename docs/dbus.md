@@ -139,6 +139,30 @@ Live numbers as JSON, refreshed every second while mirroring, `{}` otherwise:
 
 The same sender numbers are sent to the receiver (`sender_stats`) for its on-screen overlay.
 
+### `Info(s id) → s`
+
+What a person should know about a receiver, as JSON: `android` (e.g. `Android 5.1`; empty until it has been
+connected once), `limits` (what works worse on its Android, in plain words), `audio_latency_ms` (how far its sound
+trails the picture) and `audio` (the sound mode in use). From the receiver's `welcome` (`sdk`, `limits`).
+
+### `SetAudio(s id, s mode)` / `GetAudio(s id) → s`
+
+The sound for the next show to a receiver, remembered in `~/.config/luch/audio`:
+
+| `mode` | Sound |
+|--------|-------|
+| `auto` (default) | `sync` where the receiver cannot make its sound short (`audio_lag`: Android 5 and 6), else `on` |
+| `on` | played as it arrives, `audio_latency_ms` after the picture |
+| `off` | not sent: the picture only, the lowest latency |
+| `sync` | the receiver holds each picture back by its audio delay, so both come out together |
+
+### `Reports() → s`, `ReportUrl(s id) → s`, `DismissReport(s id)`
+
+Crash and error reports the receivers handed over (luchd asks for them with `"want": ["reports"]`), as a JSON array,
+oldest first; each as the receiver sent it plus `receiver_model`. Kept in `~/.config/luch/reports` and announced
+with a desktop notification that opens the issue. `ReportUrl` is that link (the receiver project's new-issue page
+with title and body filled in); `DismissReport` forgets one.
+
 ## Signals
 
 ### `ReceiversChanged()`

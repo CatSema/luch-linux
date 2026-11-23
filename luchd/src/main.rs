@@ -4,7 +4,9 @@
 mod discovery;
 mod display;
 mod enc;
+mod limits;
 mod mirror;
+mod reports;
 mod web_tls;
 
 use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
@@ -62,6 +64,7 @@ struct State {
     stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
     welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
+    audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -252,6 +255,68 @@ impl Luch {
         }
     }
 
+    /// The sound for the next show to a receiver: "auto" (with the picture held back to match where the receiver
+    /// cannot make it short, Android 5 and 6; else as it comes), "on" (as it comes), "off" (picture only, the lowest
+    /// latency) or "sync" (always held to match). Saved across restarts.
+    async fn set_audio(&self, id: String, mode: String) -> fdo::Result<()> {
+        if !limits::AUDIO_MODES.contains(&mode.as_str()) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "audio must be auto|on|off|sync, not {mode}"
+            )));
+        }
+        save_choice("audio", &id, &mode);
+        self.st.lock().await.audio.insert(id, mode);
+        Ok(())
+    }
+
+    /// The saved sound choice for a receiver ("auto" when none).
+    async fn get_audio(&self, id: String) -> String {
+        audio_choice(&self.st, &id).await
+    }
+
+    /// What a person should know about a receiver, as JSON: `android` ("Android 5.1", empty until connected once),
+    /// `limits` (what works worse there, in plain words), `audio_latency_ms`, `audio` (the sound mode in use).
+    async fn info(&self, id: String) -> String {
+        let welcome = self
+            .st
+            .lock()
+            .await
+            .welcomes
+            .get(&id)
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({
+            "android": welcome["sdk"].as_u64().map(limits::android).unwrap_or_default(),
+            "limits": limits::describe(&welcome),
+            "audio_latency_ms": limits::audio_latency_ms(&welcome),
+            "audio": audio_choice(&self.st, &id).await,
+        })
+        .to_string()
+    }
+
+    /// Crash and error reports the receivers handed over, as a JSON array (oldest first).
+    async fn reports(&self) -> String {
+        Value::Array(reports::list()).to_string()
+    }
+
+    /// The link that files a report as an issue (title and body filled in), "" if there is no such report.
+    async fn report_url(&self, id: String) -> String {
+        reports::list()
+            .iter()
+            .find(|r| r["id"] == id.as_str())
+            .map(reports::issue_url)
+            .unwrap_or_default()
+    }
+
+    /// Forgets a report (filed or not worth it).
+    async fn dismiss_report(&self, id: String) -> fdo::Result<()> {
+        if reports::remove(&id) {
+            Ok(())
+        } else {
+            Err(fdo::Error::InvalidArgs(format!("no report {id}")))
+        }
+    }
+
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
         let tx = self.st.lock().await.mirrors.get(&id).cloned();
         let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
@@ -346,7 +411,7 @@ async fn handshake(
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
     let hello = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
-                       "want": ["mirror", "media", "photo"]});
+                       "want": ["mirror", "media", "photo", "reports"]});
     send(&mut wr, &hello).await?;
     let welcome = timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd))
         .await
@@ -440,6 +505,24 @@ async fn run_channel(
                     }
                     "ready" | "keyframe" | "stop" | "stats" => {
                         let _ = events.send(v);
+                    }
+                    "reports" => {
+                        let model = st.lock().await.found.get(&id).map(|r| r.model.clone()).unwrap_or_default();
+                        let items = v["items"].as_array().cloned().unwrap_or_default();
+                        let (ids, new) = reports::store(&model, &items);
+                        if !ids.is_empty()
+                            && send(&mut wr, &json!({"t": "reports_taken", "ids": ids})).await.is_err()
+                        {
+                            break "write failed";
+                        }
+                        if new > 0 {
+                            eprintln!("[luchd] {name}: {new} new report(s), see `luchctl reports`");
+                            let last = reports::list().into_iter().rev().find(|r| ids.iter().any(|i| r["id"] == i.as_str()));
+                            if let Some(r) = last {
+                                let body = format!("{}\nClick to file it as an issue; `luchctl reports` lists them all.", reports::summary(&r));
+                                reports::notify(&conn, &format!("{name} ran into a problem"), &body, Some(reports::issue_url(&r))).await;
+                            }
+                        }
                     }
                     t => {
                         let _ = send(&mut wr, &json!({"t": "error", "code": "unknown", "for": t})).await;
@@ -536,6 +619,11 @@ async fn start_mirror(
         display::Size::default()
     };
     let ws = c.media.clone();
+    let audio = limits::start_audio(
+        &audio_choice(st, id).await,
+        &welcome,
+        mirror::AUDIO_FRAME_MS,
+    );
     let address = r
         .address
         .parse()
@@ -551,6 +639,7 @@ async fn start_mirror(
         size,
         niri_virtual,
         mirror169,
+        audio,
     };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
@@ -574,7 +663,18 @@ async fn start_mirror(
     tokio::spawn(async move {
         let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
         match res {
-            Ok(why) => eprintln!("[luchd] {name}: mirroring ended ({why})"),
+            Ok(why) => {
+                eprintln!("[luchd] {name}: mirroring ended ({why})");
+                if why.starts_with("the receiver could not show") {
+                    reports::notify(
+                        &conn,
+                        &format!("{name} did not show the picture"),
+                        why,
+                        None,
+                    )
+                    .await;
+                }
+            }
             Err(e) => eprintln!("[luchd] {name}: mirroring failed: {e}"),
         }
         {
@@ -1070,8 +1170,17 @@ pub(crate) fn config_dir() -> io::Result<std::path::PathBuf> {
 /// The video codec chosen per receiver, kept in ~/.config/luch/codec (one `id=codec` line each), so that the choice
 /// survives restarts and holds whichever front-end starts the show.
 fn saved_codecs() -> HashMap<String, String> {
+    saved_choices("codec")
+}
+
+fn save_codec(id: &str, codec: &str) {
+    save_choice("codec", id, codec)
+}
+
+/// A per-receiver choice kept in ~/.config/luch/<file>, one `id=value` line each (codec, audio).
+fn saved_choices(file: &str) -> HashMap<String, String> {
     let text = config_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("codec")))
+        .and_then(|d| std::fs::read_to_string(d.join(file)))
         .unwrap_or_default();
     text.lines()
         .filter_map(|l| l.split_once('='))
@@ -1079,12 +1188,22 @@ fn saved_codecs() -> HashMap<String, String> {
         .collect()
 }
 
-fn save_codec(id: &str, codec: &str) {
-    let mut all = saved_codecs();
-    all.insert(id.to_string(), codec.to_string());
+fn save_choice(file: &str, id: &str, value: &str) {
+    let mut all = saved_choices(file);
+    all.insert(id.to_string(), value.to_string());
     if let Ok(d) = config_dir() {
         let text: String = all.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-        let _ = std::fs::write(d.join("codec"), text);
+        let _ = std::fs::write(d.join(file), text);
+    }
+}
+
+/// The sound mode for a receiver: set in this run, else saved, else "auto".
+async fn audio_choice(st: &Shared, id: &str) -> String {
+    match st.lock().await.audio.get(id).cloned() {
+        Some(m) => m,
+        None => saved_choices("audio")
+            .remove(id)
+            .unwrap_or_else(|| "auto".into()),
     }
 }
 
@@ -1160,6 +1279,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A receiver that has reports gets them taken over the control channel: answered with `reports_taken`, kept on
+    /// disk. Needs a session bus (the channel signals changes on it); skipped without one.
+    #[tokio::test]
+    async fn reports_from_a_receiver_are_taken_and_kept() {
+        let Ok(conn) = Connection::session().await else {
+            eprintln!("no session bus: skipped");
+            return;
+        };
+        let home = std::env::temp_dir().join(format!("luch-chan-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &home);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, (server, _)) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            listener.accept().await.unwrap()
+        });
+        let (rd, wr) = client.unwrap().into_split();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (events, _) = broadcast::channel(16);
+        let st = Shared::default();
+        tokio::spawn(run_channel(
+            "TV".into(),
+            "rx".into(),
+            BufReader::new(rd),
+            wr,
+            cmd_rx,
+            events,
+            st,
+            conn,
+        ));
+
+        let (srd, mut swr) = server.into_split();
+        let mut srd = BufReader::new(srd);
+        let id = "3f0c2a8e-9d1b-4c7e-8a55-0b6f2d9e1c47";
+        let line = json!({"t": "reports", "items": [{"id": id, "kind": "crash", "time": 1, "count": 1,
+                          "what": "java.lang.IllegalStateException", "stack": "", "app": "0.4", "android": "5.1", "sdk": 22}]});
+        swr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        let taken = timeout(Duration::from_secs(5), async {
+            loop {
+                let mut l = String::new();
+                if srd.read_line(&mut l).await.unwrap() == 0 {
+                    return None;
+                }
+                let v: Value = serde_json::from_str(&l).unwrap();
+                if v["t"] == "reports_taken" {
+                    return Some(v);
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .expect("channel closed");
+        assert_eq!(taken["ids"], json!([id]));
+        assert_eq!(reports::list().len(), 1);
+        let _ = std::fs::remove_dir_all(home);
+    }
 
     #[test]
     fn txt_parses_and_lowercases_keys() {

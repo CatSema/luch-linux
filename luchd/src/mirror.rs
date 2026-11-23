@@ -68,6 +68,8 @@ pub struct Target {
     pub niri_virtual: bool,
     pub mirror169: bool,
     pub ws: Option<mpsc::Sender<Vec<u8>>>,
+    /// The `audio` part of `start` (limits::start_audio), or None for the picture only.
+    pub audio: Option<Value>,
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -1226,9 +1228,11 @@ pub async fn run(
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
-    let start = json!({"t": "start", "mode": "mirror",
-        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS},
-        "audio": {"codec": "audio/opus", "rate": 48000, "channels": 2, "frame_ms": AUDIO_FRAME_MS}});
+    let mut start = json!({"t": "start", "mode": "mirror",
+        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}});
+    if let Some(a) = &t.audio {
+        start["audio"] = a.clone();
+    }
     cmd.send(Cmd::Send(start))
         .await
         .map_err(|_| "control channel closed")?;
@@ -1366,7 +1370,7 @@ pub async fn run(
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => {
                     eprintln!("[luchd] {}: receiver sent {v}", t.name);
-                    break Ok("stopped by receiver");
+                    break Ok(crate::limits::stop_reason(&v));
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break Ok("control channel closed"),

@@ -16,14 +16,22 @@ trait Luch1 {
     fn mirror(&self, id: &str, source: &str) -> zbus::Result<()>;
     fn stop_mirror(&self, id: &str) -> zbus::Result<()>;
     fn stats(&self, id: &str) -> zbus::Result<String>;
+    fn info(&self, id: &str) -> zbus::Result<String>;
+    fn set_audio(&self, id: &str, mode: &str) -> zbus::Result<()>;
+    fn reports(&self) -> zbus::Result<String>;
+    fn report_url(&self, id: &str) -> zbus::Result<String>;
+    fn dismiss_report(&self, id: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id]
+const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
+                | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive";
+
+const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
 const SOURCES: [&str; 4] = ["fast", "monitor", "window", "virtual"];
 
@@ -132,6 +140,87 @@ async fn run(args: &[String]) -> Result<(), String> {
             .stop_mirror(&find_id(&p, key.first().copied()).await?)
             .await
             .map_err(e)?,
+        ["info", key @ ..] if key.len() <= 1 => {
+            let id = find_id(&p, key.first().copied()).await?;
+            let v: serde_json::Value =
+                serde_json::from_str(&p.info(&id).await.map_err(e)?).unwrap_or_default();
+            let android = v["android"].as_str().unwrap_or("");
+            println!(
+                "{}",
+                if android.is_empty() {
+                    "Android version unknown until connected (luchctl connect)"
+                } else {
+                    android
+                }
+            );
+            println!(
+                "sound: {}{}",
+                v["audio"].as_str().unwrap_or("auto"),
+                v["audio_latency_ms"]
+                    .as_u64()
+                    .map(|ms| format!(", trails the picture by about {ms} ms"))
+                    .unwrap_or_default()
+            );
+            for l in v["limits"].as_array().into_iter().flatten() {
+                println!("  - {}", l.as_str().unwrap_or(""));
+            }
+        }
+        ["audio", mode] if AUDIO.contains(mode) => p
+            .set_audio(&find_id(&p, None).await?, mode)
+            .await
+            .map_err(e)?,
+        ["audio", key, mode] if AUDIO.contains(mode) => p
+            .set_audio(&find_id(&p, Some(key)).await?, mode)
+            .await
+            .map_err(e)?,
+        ["reports"] => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.reports().await.map_err(e)?).unwrap_or_default();
+            if all.is_empty() {
+                println!("no reports");
+            }
+            for (n, r) in all.iter().enumerate() {
+                println!(
+                    "{}. {} {}: {}{}",
+                    n + 1,
+                    r["receiver_model"]
+                        .as_str()
+                        .or(r["device"].as_str())
+                        .unwrap_or("?"),
+                    r["kind"].as_str().unwrap_or("?"),
+                    r["what"].as_str().unwrap_or("?"),
+                    match r["count"].as_i64() {
+                        Some(c) if c > 1 => format!(" ({c} times)"),
+                        _ => String::new(),
+                    }
+                );
+            }
+        }
+        ["report", n, action @ ..] if action.len() <= 1 => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.reports().await.map_err(e)?).unwrap_or_default();
+            let r = n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| all.get(n.wrapping_sub(1)))
+                .ok_or(format!("no report {n} (see `luchctl reports`)"))?;
+            let id = r["id"].as_str().unwrap_or("");
+            match action.first().copied() {
+                None => println!("{}", serde_json::to_string_pretty(r).unwrap_or_default()),
+                Some("open") => {
+                    let url = p.report_url(id).await.map_err(e)?;
+                    if std::process::Command::new("xdg-open")
+                        .arg(&url)
+                        .spawn()
+                        .is_err()
+                    {
+                        println!("{url}");
+                    }
+                }
+                Some("dismiss") => p.dismiss_report(id).await.map_err(e)?,
+                Some(other) => return Err(format!("report {n} open|dismiss, not {other}")),
+            }
+        }
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
             p.refresh().await.map_err(e)?;
