@@ -791,11 +791,12 @@ fn pipeline(
     } else {
         String::new()
     };
-    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD (DCC), linear. LUCH_DRM_FORMAT overrides.
+    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD DCC, AMD 64KB tiled, linear.
+    // LUCH_DRM_FORMAT overrides.
     let drm = std::env::var("LUCH_DRM_FORMAT")
         .map(|d| format!("\"{d}\""))
         .unwrap_or_else(|_| {
-            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0\"}".into()
+            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0200000000082305\",\"NV12:0x0\"}".into()
         });
     // Zero copy: compositor DMA-BUF -> GPU conversion -> DMA-BUF -> VA-API encoder.
     let (width, height) = (size.width, size.height);
