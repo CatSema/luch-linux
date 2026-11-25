@@ -1314,7 +1314,7 @@ pub async fn run(
             _ => format!("pipeline: {e}"),
         });
     }
-    let virtual_monitor = if let Some(layout) = layout {
+    let virtual_monitor = if let Some(layout) = &layout {
         match layout.place_new_right(size).await {
             Ok(connector) => Some(connector),
             Err(e) => {
@@ -1395,6 +1395,13 @@ pub async fn run(
     if let Some((_sc, session, fd, _)) = portal {
         let _ = session.close().await;
         drop(fd);
+    }
+    // Removing the virtual monitor must not disturb the physical ones: restore the layout that
+    // was active before extend, once Mutter has dropped the virtual connector.
+    if let (Some(layout), Some(connector)) = (&layout, &virtual_monitor) {
+        if let Err(e) = layout.restore(connector).await {
+            eprintln!("[luchd] restore display layout: {e}");
+        }
     }
     why
 }
