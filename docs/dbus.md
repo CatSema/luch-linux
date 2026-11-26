@@ -163,6 +163,33 @@ oldest first; each as the receiver sent it plus `receiver_model`. Kept in `~/.co
 with a desktop notification that opens the issue. `ReportUrl` is that link (the receiver project's new-issue page
 with title and body filled in); `DismissReport` forgets one.
 
+### `Known() → s`
+
+Every receiver luchd has connected to (kept in `~/.config/luch/known.json`), as a JSON array: `id`, `name`, `model`,
+`address`, `seen` (unix time of the last connection), `mac` and `ble` when known, `online` (on the LAN now), `wake`
+(the ways it can be turned on: `wol`, `ble`) and `hint` when it needs something first (an XGIMI without a learned
+remote signal).
+
+### `Wake(s id) → s`
+
+Turns a known receiver on from standby, every way known for it, and returns those ways (`wol,ble`). `wol`: a
+Wake-on-LAN magic packet to the MAC noted from the ARP table while the receiver was on. `ble`: the remote's power-key
+advertisement (Bluetooth company id 0x0046, MediaTek) through BlueZ on the system bus, first as learned for 1.5 s,
+then with each other value of its first byte (the remote's press counter): about 13 s in all. Fails when there is no
+way yet or none of them could be sent (no Bluetooth adapter, Bluetooth off). The receiver then appears through
+`ReceiversChanged`.
+
+### `LearnWake(s id, u seconds) → s`
+
+Scans Bluetooth LE for up to `seconds` (5–120) for a MediaTek remote's power-key advertisement, keeps it as the
+receiver's `ble` and returns it as hex. The receiver should be off, so that its remote advertises instead of
+connecting.
+
+### `SetWake(s id, s kind, s value)`
+
+Sets `kind` `mac` (`aa:bb:cc:dd:ee:ff`) or `ble` (the manufacturer data in hex, without the company id) by hand; an
+empty `value` forgets it.
+
 ## Signals
 
 ### `ReceiversChanged()`
@@ -234,6 +261,7 @@ proxy.connectSignal('ReceiversChanged', () => { /* refresh */ });
 | Path / variable | Purpose |
 |-----------------|---------|
 | `~/.config/luch/id` | sender id |
+| `~/.config/luch/known.json` | receivers luchd has connected to, with the ways to wake them |
 | `~/.config/luch/restore-token` | screencast portal restore token (no picker after the first time) |
 | `LUCH_KMS_SOCKET` | a privileged `luch-kms --serve SOCKET [--uid N]` that `luchd` uses for the `fast` mode instead of running `luch-kms` itself (default `$XDG_RUNTIME_DIR/luch/kms.sock`, used when it exists): for a `luchd` in a sandbox (Flatpak), where file capabilities do not work. The socket is owned by `--uid`, mode 0600 |
 | `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM card and render node for `luch-kms` (default: the card with an active plane, and the render node of the same GPU) |

@@ -21,6 +21,10 @@ trait Luch1 {
     fn reports(&self) -> zbus::Result<String>;
     fn report_url(&self, id: &str) -> zbus::Result<String>;
     fn dismiss_report(&self, id: &str) -> zbus::Result<()>;
+    fn known(&self) -> zbus::Result<String>;
+    fn wake(&self, id: &str) -> zbus::Result<String>;
+    fn learn_wake(&self, id: &str, seconds: u32) -> zbus::Result<String>;
+    fn set_wake(&self, id: &str, kind: &str, value: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(property)]
@@ -28,8 +32,11 @@ trait Luch1 {
 }
 
 const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
-                | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]]
-       r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive";
+                | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
+                | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off]
+       r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
+       wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
+       `wake <r> learn` picks up while you press the remote's power key with the receiver off)";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -57,6 +64,55 @@ fn print(rows: &[ReceiverRow]) {
             format!("{addr}:{port}")
         );
     }
+}
+
+/// Every receiver luchd has talked to (Known), and one of them by id or name; with no key, the only one.
+async fn known(
+    p: &Luch1Proxy<'_>,
+    key: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<serde_json::Value>), String> {
+    let all: Vec<serde_json::Value> =
+        serde_json::from_str(&p.known().await.map_err(|e| e.to_string())?).unwrap_or_default();
+    let hits: Vec<_> = all
+        .iter()
+        .filter(|r| match key {
+            None => true,
+            Some(k) => {
+                r["id"] == k
+                    || r["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(k))
+            }
+        })
+        .cloned()
+        .collect();
+    let one = match (key, hits.as_slice()) {
+        (_, [one]) => Some(one.clone()),
+        (None, _) => None,
+        (Some(k), []) => {
+            return Err(format!(
+                "luchd has not talked to '{k}' yet (see `luchctl known`)"
+            ))
+        }
+        (Some(k), _) => return Err(format!("'{k}' is ambiguous, use the id")),
+    };
+    Ok((all, one))
+}
+
+fn need_one(
+    one: Option<serde_json::Value>,
+    all: &[serde_json::Value],
+) -> Result<serde_json::Value, String> {
+    one.ok_or_else(|| {
+        if all.is_empty() {
+            "no known receivers: connect to one once while it is on".into()
+        } else {
+            format!(
+                "{} known receivers, name one (see `luchctl known`)",
+                all.len()
+            )
+        }
+    })
 }
 
 /// Receiver by id or name; with no key, the only receiver on the LAN.
@@ -220,6 +276,86 @@ async fn run(args: &[String]) -> Result<(), String> {
                 Some("dismiss") => p.dismiss_report(id).await.map_err(e)?,
                 Some(other) => return Err(format!("report {n} open|dismiss, not {other}")),
             }
+        }
+        ["known"] => {
+            let (all, _) = known(&p, None).await?;
+            if all.is_empty() {
+                println!("(none yet: luchd remembers a receiver once it has connected to it)");
+            }
+            for r in &all {
+                let wake: Vec<&str> = r["wake"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m.as_str())
+                    .collect();
+                println!(
+                    "{:<38} {:<20} {:<16} {:<8} wake: {}",
+                    r["id"].as_str().unwrap_or(""),
+                    r["name"].as_str().unwrap_or(""),
+                    r["model"].as_str().unwrap_or(""),
+                    if r["online"] == true { "on" } else { "off" },
+                    if wake.is_empty() {
+                        "-".to_string()
+                    } else {
+                        wake.join(", ")
+                    }
+                );
+                if let Some(h) = r["hint"].as_str() {
+                    println!("{:<38} {h}", "");
+                }
+            }
+        }
+        ["wake", key @ ..] if key.len() <= 1 => {
+            let (all, one) = known(&p, key.first().copied()).await?;
+            let r = need_one(one, &all)?;
+            let (id, name) = (
+                r["id"].as_str().unwrap_or(""),
+                r["name"].as_str().unwrap_or(""),
+            );
+            if r["online"] == true {
+                println!("{name} is already on");
+                return Ok(());
+            }
+            let mut changes = p.receive_receivers_changed().await.map_err(e)?;
+            let how = p.wake(id).await.map_err(e)?;
+            println!("waking {name} ({how}), waiting for it on the LAN…");
+            let up = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                loop {
+                    if p.receivers()
+                        .await
+                        .is_ok_and(|rows| rows.iter().any(|row| row.0 == id))
+                    {
+                        return;
+                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), changes.next())
+                        .await;
+                    let _ = p.refresh().await;
+                }
+            })
+            .await;
+            match up {
+                Ok(()) => println!("{name} is on"),
+                Err(_) => return Err(format!("{name} did not show up in 90 s")),
+            }
+        }
+        ["wake", key, "learn"] => {
+            let (all, one) = known(&p, Some(key)).await?;
+            let r = need_one(one, &all)?;
+            println!("listening 30 s: with {} off, press the power key on its remote near this computer…", r["name"].as_str().unwrap_or(key));
+            let adv = p
+                .learn_wake(r["id"].as_str().unwrap_or(""), 30)
+                .await
+                .map_err(e)?;
+            println!("learned {adv}; `luchctl wake {key}` turns it on now");
+        }
+        ["wake", key, kind @ ("mac" | "ble"), value] => {
+            let (all, one) = known(&p, Some(key)).await?;
+            let r = need_one(one, &all)?;
+            let value = if *value == "off" { "" } else { value };
+            p.set_wake(r["id"].as_str().unwrap_or(""), kind, value)
+                .await
+                .map_err(e)?;
         }
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;

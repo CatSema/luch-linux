@@ -18,6 +18,8 @@ const IFACE = `<node>
     <method name="StopMirror"><arg name="id" type="s" direction="in"/></method>
     <method name="Disconnect"><arg name="id" type="s" direction="in"/></method>
     <method name="Stats"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="Known"><arg type="s" direction="out"/></method>
+    <method name="Wake"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <signal name="ReceiversChanged"/>
   </interface>
@@ -42,6 +44,8 @@ const T = RU ? {
     receivers: n => `Приёмников: ${n}`,
     web: 'Веб-приёмник — откройте в браузере ТВ',
     webOpen: 'Открыть в браузере этого компьютера',
+    turnOn: name => `Включить ${name}`,
+    waking: name => `Включаю ${name}…`,
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -56,6 +60,8 @@ const T = RU ? {
     receivers: n => `${n} receiver${n === 1 ? '' : 's'}`,
     web: 'Web receiver — open in the TV\u2019s browser',
     webOpen: 'Open in this computer\u2019s browser',
+    turnOn: name => `Turn on ${name}`,
+    waking: name => `Turning on ${name}…`,
 };
 
 const LuchToggle = GObject.registerClass(
@@ -64,6 +70,8 @@ class LuchToggle extends QuickMenuToggle {
         super._init({title: T.title, gicon: ICON, toggleMode: false});
         this._onMirroringChanged = onMirroringChanged;
         this._rows = [];
+        this._asleep = []; // known receivers that are off and can be woken: [id, name]
+        this._waking = new Set();
         this._lastId = null;
         this._statsTimer = 0;
 
@@ -110,6 +118,14 @@ class LuchToggle extends QuickMenuToggle {
         } catch (e) {
             this._rows = [];
         }
+        try {
+            const [json] = await this._proxy.KnownAsync();
+            this._asleep = JSON.parse(json)
+                .filter(r => !r.online && r.wake?.length > 0)
+                .map(r => [r.id, r.name]);
+        } catch (e) {
+            this._asleep = []; // an older luchd
+        }
         this._render(null);
     }
 
@@ -119,7 +135,7 @@ class LuchToggle extends QuickMenuToggle {
         this._onMirroringChanged(this.checked);
 
         this._section.removeAll();
-        if (note || this._rows.length === 0) {
+        if (note || (this._rows.length === 0 && this._asleep.length === 0)) {
             const item = new PopupMenu.PopupMenuItem(note ?? T.searching, {reactive: false});
             this._section.addMenuItem(item);
         }
@@ -143,6 +159,16 @@ class LuchToggle extends QuickMenuToggle {
             if (connected)
                 add(T.disconnect, () => this._proxy.DisconnectAsync(id));
             this._section.addMenuItem(sub);
+        }
+
+        // Receivers that are off: one tap turns them on (Wake-on-LAN or the remote's Bluetooth signal).
+        for (const [id, name] of this._asleep) {
+            const waking = this._waking.has(id);
+            const item = new PopupMenu.PopupImageMenuItem(
+                waking ? T.waking(name) : T.turnOn(name), 'system-shutdown-symbolic');
+            item.setSensitive(!waking);
+            item.connect('activate', () => this._wake(id));
+            this._section.addMenuItem(item);
         }
 
         // Built-in web receiver: the URL for the TV; opening it on the PC is a quick test.
@@ -170,6 +196,23 @@ class LuchToggle extends QuickMenuToggle {
             this._stopStats();
             this.subtitle = note ?? (this._rows.length === 1 ? this._rows[0][1] : T.receivers(this._rows.length));
         }
+    }
+
+    async _wake(id) {
+        this._waking.add(id);
+        this._render(null);
+        try {
+            await this._proxy.WakeAsync(id);
+        } catch (e) {
+            logError(e, 'Luch: wake');
+        }
+        // It shows up through ReceiversChanged once it is on the LAN; until then the item says it is waking.
+        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
+            this._waking.delete(id);
+            if (this._proxy)
+                this._refresh();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _mirror(id, source) {

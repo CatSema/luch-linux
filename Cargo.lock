@@ -684,7 +684,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "luch-kms"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc",
  "pkg-config",
@@ -692,11 +692,11 @@ dependencies = [
 
 [[package]]
 name = "luch-proto"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "luch-recv"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gstreamer",
  "gstreamer-app",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "luchctl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "luch-proto",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "luchd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ashpd",
  "cc",

@@ -7,6 +7,7 @@ mod enc;
 mod limits;
 mod mirror;
 mod reports;
+mod wake;
 mod web_tls;
 
 use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
@@ -144,6 +145,8 @@ impl Luch {
             );
             st.welcomes.insert(id.clone(), welcome.clone());
         }
+        // Remembered with its MAC (the handshake has just filled the ARP table), to wake it later.
+        wake::remember(&id, &r.name, &r.model, &r.address);
         eprintln!(
             "[luchd] connected to {} ({}:{} via {})",
             r.name, r.address, r.port, r.ifname
@@ -315,6 +318,65 @@ impl Luch {
         } else {
             Err(fdo::Error::InvalidArgs(format!("no report {id}")))
         }
+    }
+
+    /// Every receiver luchd has talked to, as a JSON array: `id`, `name`, `model`, `address`, `mac`, `ble`, `seen`
+    /// (unix time), `online` (on the LAN now), `wake` (the ways it can be turned on: "wol", "ble") and `hint` (what
+    /// to do when there is none yet).
+    async fn known(&self) -> String {
+        let st = self.st.lock().await;
+        let rows: Vec<Value> = wake::load()
+            .into_iter()
+            .map(|(id, mut r)| {
+                r["id"] = json!(id);
+                r["online"] = json!(st.found.contains_key(&id));
+                r["wake"] = json!(wake::methods(&r));
+                if let Some(h) = wake::hint(&r) {
+                    r["hint"] = json!(h);
+                }
+                r
+            })
+            .collect();
+        Value::Array(rows).to_string()
+    }
+
+    /// Turns a known receiver on from standby, every way it can be (Wake-on-LAN, the remote's Bluetooth
+    /// advertisement); returns the ways tried, e.g. "wol,ble". Takes up to about 15 s with Bluetooth. The receiver
+    /// shows up in Receivers once it is up.
+    async fn wake(&self, id: String) -> fdo::Result<String> {
+        let r = wake::load()
+            .remove(&id)
+            .ok_or_else(|| fdo::Error::InvalidArgs(format!("unknown receiver: {id}")))?;
+        let tried = wake::wake(&r).await.map_err(fdo::Error::Failed)?;
+        eprintln!(
+            "[luchd] waking {} ({})",
+            r["name"].as_str().unwrap_or(&id),
+            tried.join(", ")
+        );
+        self.discovery.refresh();
+        Ok(tried.join(","))
+    }
+
+    /// Listens up to `seconds` for the remote's power key over Bluetooth and keeps that advertisement for waking
+    /// the receiver; returns it as hex. The receiver should be off, so that the remote advertises.
+    async fn learn_wake(&self, id: String, seconds: u32) -> fdo::Result<String> {
+        if !wake::load().contains_key(&id) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "unknown receiver {id}: connect to it once first"
+            )));
+        }
+        let adv = wake::learn(u64::from(seconds.clamp(5, 120)))
+            .await
+            .map_err(fdo::Error::Failed)?;
+        let hex = wake::hex(&adv);
+        wake::set(&id, "ble", &hex).map_err(fdo::Error::Failed)?;
+        Ok(hex)
+    }
+
+    /// Sets how to wake a known receiver by hand: `kind` "mac" (for Wake-on-LAN) or "ble" (the remote's MediaTek
+    /// manufacturer data, hex); an empty `value` forgets it.
+    async fn set_wake(&self, id: String, kind: String, value: String) -> fdo::Result<()> {
+        wake::set(&id, &kind, &value).map_err(fdo::Error::InvalidArgs)
     }
 
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {

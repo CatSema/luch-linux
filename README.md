@@ -135,6 +135,9 @@ luchctl info                              # the receiver's Android and what work
 luchctl audio sync                        # sound: auto | on | off | sync (per receiver, remembered)
 luchctl reports                           # crash and error reports the receivers handed over
 luchctl report 1 open                     # file one as an issue (or: report 1, report 1 dismiss)
+luchctl known                             # every receiver luchd has talked to, on or off, and how to wake it
+luchctl wake                              # turn a receiver on from standby and wait for it
+luchctl wake "XGIMI MoGo 4 Laser" learn   # pick up its remote's power signal over Bluetooth (receiver off)
 ```
 
 **Sound on older receivers.** Android 5 and 6 cannot make the receiver's sound short: it trails the picture by
@@ -146,8 +149,20 @@ later `auto` plays the sound as it comes, about 20 ms behind.
 them to luchd, which keeps them in `~/.config/luch/reports` and shows a notification: click it to open a filled-in
 issue for the receiver's project. Nothing is sent anywhere unless you file it.
 
+**Turning a receiver on.** luchd remembers every receiver it has connected to, so it can turn one on that is off
+(Quick Settings: **Turn on …**, or `luchctl wake`). Nothing goes through the internet; there are two ways, and luchd
+tries every one it knows for that receiver:
+
+- *Wake-on-LAN*, for TVs that stay on the network in standby (Sony "Remote start", TCL "Network standby", LG,
+  Samsung): luchd notes the TV's MAC address while it is on. Turn that setting on in the TV.
+- *The remote's Bluetooth signal*, for projectors and TVs that leave the network in standby (XGIMI and other
+  MediaTek-based Google TVs): with the receiver off, run `luchctl wake <r> learn` and press the power key on its
+  remote near the computer. luchd then sends that signal itself (through BlueZ; the computer's Bluetooth must be
+  on and in range). The remote counts its presses, so luchd also sends the following counts, which takes about
+  13 s. The values can also be set by hand: `luchctl wake <r> mac <address>`, `luchctl wake <r> ble <hex>`.
+
 **Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md) (also `Info`,
-`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`).
+`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Known`, `Wake`, `LearnWake`, `SetWake`).
 
 ## Troubleshooting
 
