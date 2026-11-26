@@ -110,8 +110,35 @@ static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC img_to_tex;
 
 // ---------- EGL / GLES ----------
 
-static EGLDisplay egl_init(void) {
-    EGLDisplay d = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+static EGLDisplay egl_init(const char *render) {
+    // Import scanout buffers into an EGL context on the same GPU that owns the KMS card. Mesa's
+    // surfaceless platform otherwise picks the first render node, which on a hybrid system can be
+    // another GPU; eglCreateImage() then fails with EGL_BAD_MATCH for every frame.
+    EGLDisplay d = EGL_NO_DISPLAY;
+    PFNEGLQUERYDEVICESEXTPROC query_devices = (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
+    PFNEGLQUERYDEVICESTRINGEXTPROC device_string = (PFNEGLQUERYDEVICESTRINGEXTPROC)eglGetProcAddress("eglQueryDeviceStringEXT");
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (render && query_devices && device_string && get_platform_display) {
+        EGLDeviceEXT devices[16];
+        EGLint n = 0;
+        if (query_devices(16, devices, &n)) {
+            for (EGLint i = 0; i < n; i++) {
+                const char *node = device_string(devices[i], EGL_DRM_RENDER_NODE_FILE_EXT);
+                if (!node) node = device_string(devices[i], EGL_DRM_DEVICE_FILE_EXT);
+                if (!node || strcmp(node, render)) continue;
+                d = get_platform_display(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL);
+                if (d != EGL_NO_DISPLAY) {
+                    fprintf(stderr, "luch-kms: EGL device %s\n", node);
+                    break;
+                }
+                d = EGL_NO_DISPLAY;
+            }
+        }
+    }
+    if (d == EGL_NO_DISPLAY) {
+        d = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        fprintf(stderr, "luch-kms: EGL device: default (no match for %s)\n", render ? render : "?");
+    }
     if (d == EGL_NO_DISPLAY || !eglInitialize(d, NULL, NULL)) DIE("EGL init failed");
     eglBindAPI(EGL_OPENGL_ES_API);
     const EGLint ctx_attr[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE };
@@ -347,7 +374,7 @@ enum { SCALE_FIT, SCALE_FILL, SCALE_STRETCH };
 
 int luch_kms_main(int argc, char **argv) {
     const char *card_path = getenv("LUCH_KMS_CARD");
-    const char *render = getenv("LUCH_KMS_RENDER") ? getenv("LUCH_KMS_RENDER") : "/dev/dri/renderD128";
+    const char *render_env = getenv("LUCH_KMS_RENDER");
     int W = 1920, H = 1080, FPS = 60, KBPS = 20000, bench = 0;
     const char *codec_name = "h264_vaapi";
     for (int i = 1; i < argc; i++) {
@@ -376,11 +403,28 @@ int luch_kms_main(int argc, char **argv) {
     }
     if (!plane) DIE("no active display plane on any /dev/dri/card* (luch-kms needs CAP_SYS_ADMIN)");
 
+    // Encode on the GPU that owns the KMS card unless the user overrides it. This also selects the
+    // matching EGL device below, so the scanout DMA-BUFs can be imported into its context.
+    char render_buf[64];
+    const char *render = render_env;
+    if (!render) {
+        drmDevicePtr dev = NULL;
+        if (drmGetDevice2(card, 0, &dev) == 0 && dev && (dev->available_nodes & (1 << DRM_NODE_RENDER)) &&
+            dev->nodes[DRM_NODE_RENDER]) {
+            snprintf(render_buf, sizeof render_buf, "%s", dev->nodes[DRM_NODE_RENDER]);
+            render = render_buf;
+        } else {
+            render = "/dev/dri/renderD128";
+        }
+        if (dev) drmFreeDevice(&dev);
+    }
+    fprintf(stderr, "luch-kms: render node %s\n", render);
+
     PlaneProps cpp = {0};
     uint32_t cursor_plane = find_cursor(card, plane, &cpp);
     if (!cursor_plane) fprintf(stderr, "luch-kms: no cursor plane; the cursor will be missing unless the compositor draws it\n");
 
-    EGLDisplay egl = egl_init();
+    EGLDisplay egl = egl_init(render);
     GLuint prog_y = program(FRAG_Y), prog_uv = program(FRAG_UV);
     GLuint progs[2] = { prog_y, prog_uv };
     for (int i = 0; i < 2; i++) {
