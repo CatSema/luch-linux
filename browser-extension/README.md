@@ -1,7 +1,7 @@
 # Luch for the browser
 
 Sends a video from any web page to a TV with Luch. The TV plays the video itself, in the quality the site offers up
-to what its screen can show. The page gets the TV's controls over its own player: play/pause, position, speed,
+to what its screen can show. The page gets the TV's controls along the top of its own player (the site's own controls stay usable below and drive the TV too): play/pause, position, speed, quality,
 sound track and subtitles. The TV's remote works too, and both stay in step.
 
 ## Setup

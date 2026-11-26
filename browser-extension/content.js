@@ -26,8 +26,11 @@
     .btn{position:fixed;pointer-events:auto;display:none;align-items:center;gap:6px;padding:6px 10px;border-radius:16px;
       border:0;background:#121318e6;color:#ffba5f;cursor:pointer;box-shadow:0 2px 8px #0008}
     .btn:hover{background:#292a2f}
-    .panel{position:fixed;pointer-events:auto;display:none;flex-direction:column;justify-content:flex-end;gap:8px;
-      padding:14px;background:linear-gradient(#0000,#000d 55%);color:#e3e2e8}
+    .panel{position:fixed;pointer-events:auto;display:none;flex-direction:column;gap:8px;
+      padding:10px 14px 18px;background:linear-gradient(#000d 60%,#0000);color:#e3e2e8}
+    .panel.small .more{display:none}
+    .panel.small{padding-bottom:10px;background:#000b;border-radius:0 0 12px 0}
+    button.fold{margin-left:auto}
     .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
     .title{font-weight:600;color:#ffba5f}
     button.c,select{background:#292a2f;color:#e3e2e8;border:1px solid #47484d;border-radius:8px;padding:4px 8px;cursor:pointer}
@@ -42,15 +45,15 @@
   </style>
   <button class="btn" part="btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M21 3H3a2 2 0 0 0-2 2v3h2V5h18v14h-7v2h7a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2ZM1 18v3h3a3 3 0 0 0-3-3Zm0-4v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Zm0-4v2a9 9 0 0 1 9 9h2A11 11 0 0 0 1 10Z"/></svg><span></span></button>
   <div class="panel">
-    <div class="row"><span class="title"></span><span class="note"></span></div>
-    <div class="row">
+    <div class="row"><span class="title"></span><span class="note"></span><button class="c fold">▴</button></div>
+    <div class="row more">
       <button class="c play">⏸</button>
       <button class="c back">−10</button>
       <input type="range" class="seek" min="0" max="1000" value="0">
       <button class="c fwd">+10</button>
       <span class="time">0:00</span>
     </div>
-    <div class="row">
+    <div class="row more">
       <select class="rate"></select>
       <select class="audio"></select>
       <select class="sub"></select>
@@ -198,14 +201,19 @@
     panel.style.display = "none";
   }
 
+  /**
+   * The panel sits along the video's top edge, never over its bottom, where sites keep their own controls (quality,
+   * episodes): those stay usable, and they drive the TV (play asks the TV, a new quality is recast). Folded, it is
+   * one line in the corner.
+   */
   function follow() {
     if (!cast) return;
-    const r = cast.video.isConnected ? cast.video.getBoundingClientRect() : { left: 0, top: innerHeight - 160, width: innerWidth, height: 160 };
-    const h = Math.max(120, Math.min(r.height, 170));
+    const r = cast.video.isConnected ? cast.video.getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: 0 };
+    const small = panel.classList.contains("small");
     panel.style.left = `${Math.max(0, r.left)}px`;
-    panel.style.width = `${Math.min(innerWidth, r.width)}px`;
-    panel.style.top = `${Math.max(0, r.top + r.height - h)}px`;
-    panel.style.height = `${h}px`;
+    panel.style.width = small ? "auto" : `${Math.min(innerWidth, r.width)}px`;
+    panel.style.top = `${Math.max(0, r.top)}px`;
+    panel.style.height = "auto";
   }
 
   function LuchCore_position() {
@@ -268,6 +276,17 @@
     if (url) cast.src = url;
     send({ op: "recast", receiver: cast.receiver, url, start: LuchCore_position() });
   };
+  const fold = () => {
+    panel.classList.toggle("small");
+    $(".fold").textContent = panel.classList.contains("small") ? "▾" : "▴";
+    // The extension's own storage, not the site's.
+    B.storage.local.set({ panelSmall: panel.classList.contains("small") }).catch(() => {});
+    follow();
+  };
+  $(".fold").onclick = fold;
+  B.storage.local.get("panelSmall").then(({ panelSmall }) => {
+    if (panelSmall && !panel.classList.contains("small")) fold();
+  }).catch(() => {});
   $(".stop").onclick = () => {
     if (!cast) return;
     send({ op: "stop", receiver: cast.receiver });
