@@ -18,6 +18,7 @@ trait Luch1 {
     fn mirror(&self, id: &str, source: &str) -> zbus::Result<()>;
     fn stop_mirror(&self, id: &str) -> zbus::Result<()>;
     fn stats(&self, id: &str) -> zbus::Result<String>;
+    fn capabilities(&self, id: &str) -> zbus::Result<String>;
     fn info(&self, id: &str) -> zbus::Result<String>;
     fn set_audio(&self, id: &str, mode: &str) -> zbus::Result<()>;
     fn reports(&self) -> zbus::Result<String>;

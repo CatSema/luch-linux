@@ -16,7 +16,12 @@ sound track and subtitles. The TV's remote works too, and both stay in step.
    - **Chrome, Chromium, Brave, Edge**: `chrome://extensions` → *Developer mode* → *Load unpacked* →
      `browser-extension/`. The `key` in the manifest keeps the extension's id
      (`enoggfebgncdlpimolmheljkneecempd`), which the host manifest allows.
-   - A browser installed as a Flatpak cannot start `luchctl` outside its sandbox. Use the system package, or Firefox.
+   - **A browser installed as a Flatpak** (Chrome from Flathub, say): `luchctl browser install` puts a small script
+     into its data that starts `luchctl` outside the sandbox with `flatpak-spawn --host`. That works only once the
+     browser may do so, which you allow yourself:
+     `flatpak override --user --talk-name=org.freedesktop.Flatpak com.google.Chrome`. This lets the browser run
+     programs outside its sandbox in general, so decide whether you want it; Firefox from the system needs nothing.
+     A Flatpak browser also sees only some folders: load the extension from a copy in *Downloads*.
 
 ## Use
 

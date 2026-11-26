@@ -128,7 +128,8 @@ async function cookieFor(url) {
 
 async function receivers() {
   const list = await ask("receivers", {});
-  return list.filter((r) => !/^web/i.test(r.model || ""));
+  // Receivers that said they cannot play media (an older Luch) are left out; unknown ones stay.
+  return list.filter((r) => !/^web/i.test(r.model || "") && r.media !== false);
 }
 
 async function chosenReceiver(list) {

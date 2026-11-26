@@ -69,14 +69,21 @@ pub async fn handle(p: &Luch1Proxy<'_>, req: &Value) -> Result<Value, String> {
         "receivers" => {
             let _ = p.refresh().await;
             let rows = p.receivers().await.map_err(err_text)?;
-            Ok(Value::Array(
-                rows.into_iter()
-                    .map(|(id, name, model, _, _, _, connected, mirroring)| {
-                        json!({"id": id, "name": name, "model": model, "connected": connected,
-                               "mirroring": mirroring})
-                    })
-                    .collect(),
-            ))
+            let mut list = Vec::new();
+            for (id, name, model, _, _, _, connected, mirroring) in rows {
+                // Whether it plays media, from its last welcome; null until luchd has talked to it once.
+                let w: Value = serde_json::from_str(&p.capabilities(&id).await.unwrap_or_default())
+                    .unwrap_or(json!({}));
+                let media = w["modes"]
+                    .as_array()
+                    .map(|m| json!(m.iter().any(|x| x == "media")))
+                    .unwrap_or(Value::Null);
+                list.push(
+                    json!({"id": id, "name": name, "model": model, "connected": connected,
+                                 "mirroring": mirroring, "media": media}),
+                );
+            }
+            Ok(Value::Array(list))
         }
         "cast" => {
             let items: Vec<String> = req["items"]
@@ -211,9 +218,66 @@ pub fn manifest_dirs(home: &str) -> Vec<(String, bool)> {
     .collect()
 }
 
-/// Writes the host manifest for every browser whose profile directory exists; returns where.
+/// Browsers installed as a Flatpak: (app id, where it looks for host manifests inside its data, Firefox).
+pub const FLATPAKS: [(&str, &str, bool); 5] = [
+    (
+        "com.google.Chrome",
+        "config/google-chrome/NativeMessagingHosts",
+        false,
+    ),
+    (
+        "org.chromium.Chromium",
+        "config/chromium/NativeMessagingHosts",
+        false,
+    ),
+    (
+        "com.brave.Browser",
+        "config/BraveSoftware/Brave-Browser/NativeMessagingHosts",
+        false,
+    ),
+    (
+        "com.microsoft.Edge",
+        "config/microsoft-edge/NativeMessagingHosts",
+        false,
+    ),
+    (
+        "org.mozilla.firefox",
+        ".mozilla/native-messaging-hosts",
+        true,
+    ),
+];
+
+/// The script a sandboxed browser starts: it runs luchctl outside the sandbox, which needs the browser to be allowed
+/// to talk to org.freedesktop.Flatpak (`flatpak override --user --talk-name=org.freedesktop.Flatpak <app>`).
+pub fn flatpak_wrapper(exe: &str) -> String {
+    format!("#!/bin/sh\n# Luch: the browser extension's host, run outside the Flatpak sandbox.\nexec flatpak-spawn --host '{}' \"$@\"\n", exe.replace('\'', ""))
+}
+
+/// Writes the host manifest for every browser whose profile directory exists; returns where. For a Flatpak browser
+/// also a wrapper script inside its data, and the line that lets it run it (`needs`).
 pub fn install(exe: &str, home: &str) -> io::Result<Vec<String>> {
     let mut done = Vec::new();
+    for (app, dir, firefox) in FLATPAKS {
+        let data = format!("{home}/.var/app/{app}");
+        if !std::path::Path::new(&data).exists() {
+            continue;
+        }
+        let wrapper = format!("{data}/luch-host.sh");
+        std::fs::write(&wrapper, flatpak_wrapper(exe))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let dir = format!("{data}/{dir}");
+        std::fs::create_dir_all(&dir)?;
+        let file = format!("{dir}/dev.luch.host.json");
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&manifest(&wrapper, firefox)).unwrap(),
+        )?;
+        done.push(format!("{file} (Flatpak; also run: flatpak override --user --talk-name=org.freedesktop.Flatpak {app})"));
+    }
     for (dir, firefox) in manifest_dirs(home) {
         let parent = std::path::Path::new(&dir).parent().map(|p| p.to_path_buf());
         if !parent.is_some_and(|p| p.exists()) {
@@ -260,8 +324,23 @@ mod tests {
         std::fs::create_dir_all(home.join(".mozilla")).unwrap();
         std::fs::create_dir_all(home.join(".config/chromium")).unwrap();
         let h = home.to_string_lossy();
+        std::fs::create_dir_all(home.join(".var/app/com.google.Chrome")).unwrap();
         let done = install("/usr/bin/luchctl-host", &h).unwrap();
-        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done.len(), 3, "{done:?}");
+        let wrapper = home.join(".var/app/com.google.Chrome/luch-host.sh");
+        let script = std::fs::read_to_string(&wrapper).unwrap();
+        assert!(
+            script.contains("exec flatpak-spawn --host '/usr/bin/luchctl-host' \"$@\""),
+            "{script}"
+        );
+        let fp: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.join(".var/app/com.google.Chrome/config/google-chrome/NativeMessagingHosts/dev.luch.host.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fp["path"], wrapper.to_string_lossy().as_ref());
         let ff: Value = serde_json::from_str(
             &std::fs::read_to_string(
                 home.join(".mozilla/native-messaging-hosts/dev.luch.host.json"),
