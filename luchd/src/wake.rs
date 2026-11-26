@@ -29,10 +29,10 @@ use zbus::{
 pub const MEDIATEK: u16 = 0x0046;
 const BLUEZ: &str = "org.bluez";
 const ADV_PATH: &str = "/dev/luch/Luch1/wake";
-/// How long each advertisement is on the air: a few advertising events at a 20-30 ms interval.
-const PER_VALUE: Duration = Duration::from_millis(45);
-/// The learned advertisement first, for longer: most projectors take it as it is.
-const LEARNED_FIRST: Duration = Duration::from_millis(1500);
+/// How long the learned advertisement is on the air, about one press of the remote (it repeats a press some 50 times
+/// in a second). The very same advertisement wakes a MoGo 4 again and again: its counter byte is not checked. A sweep
+/// over the other counter values right after it kept the MoGo asleep, as if the presses cancelled each other.
+const HOLD: Duration = Duration::from_millis(2000);
 
 fn file() -> std::io::Result<PathBuf> {
     Ok(crate::config_dir()?.join("known.json"))
@@ -160,7 +160,7 @@ pub async fn wake(r: &Value) -> Result<Vec<&'static str>, String> {
     if let Some(adv) = r["ble"].as_str().and_then(parse_hex) {
         let sys = Connection::system().await.map_err(|e| e.to_string());
         let on_air = match sys {
-            Ok(sys) => advertise_on(&sys, &sweep(&adv), LEARNED_FIRST, PER_VALUE).await,
+            Ok(sys) => advertise_on(&sys, &adv, HOLD).await,
             Err(e) => Err(e),
         };
         match on_air {
@@ -270,29 +270,34 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The learned advertisement, then every other value of its counter byte, starting after the learned one (the
-/// remote has moved on since).
-fn sweep(learned: &[u8]) -> Vec<Vec<u8>> {
-    let mut all = vec![learned.to_vec()];
-    for step in 1..=255u8 {
-        let mut a = learned.to_vec();
-        a[0] = learned[0].wrapping_add(step);
-        all.push(a);
-    }
-    all
-}
-
-/// Our advertisement, as BlueZ reads it (org.bluez.LEAdvertisement1).
+/// Our advertisement, as BlueZ reads it (org.bluez.LEAdvertisement1). It copies the whole packet of the remote,
+/// not only its MediaTek data: a MoGo 4 in standby ignored a non-connectable advertisement with that data alone,
+/// and woke to this one (connectable, discoverable, a HID keyboard, as the remote's own ADV_IND).
 struct Advertisement {
     data: Vec<u8>,
 }
+
+/// GAP appearance of the remote: a keyboard.
+const KEYBOARD: u16 = 0x03c1;
 
 #[zbus::interface(name = "org.bluez.LEAdvertisement1")]
 impl Advertisement {
     fn release(&self) {}
     #[zbus(property, name = "Type")]
     fn kind(&self) -> String {
-        "broadcast".into()
+        "peripheral".into()
+    }
+    #[zbus(property, name = "ServiceUUIDs")]
+    fn service_uuids(&self) -> Vec<String> {
+        vec!["1812".into()] // Human Interface Device
+    }
+    #[zbus(property)]
+    fn appearance(&self) -> u16 {
+        KEYBOARD
+    }
+    #[zbus(property)]
+    fn discoverable(&self) -> bool {
+        true
     }
     #[zbus(property)]
     fn manufacturer_data(&self) -> HashMap<u16, OwnedValue> {
@@ -356,22 +361,11 @@ async fn adapter(sys: &Connection, iface: &str) -> Result<OwnedObjectPath, Strin
 
 /// Puts each advertisement on the air in turn through one registration: the first for `first_hold`, each other one
 /// for `each`.
-async fn advertise_on(
-    sys: &Connection,
-    list: &[Vec<u8>],
-    first_hold: Duration,
-    each: Duration,
-) -> Result<(), String> {
-    let first = list.first().ok_or("nothing to advertise")?;
+async fn advertise_on(sys: &Connection, adv: &[u8], hold: Duration) -> Result<(), String> {
     let adapter = adapter(sys, "org.bluez.LEAdvertisingManager1").await?;
     let server = sys.object_server();
     server
-        .at(
-            ADV_PATH,
-            Advertisement {
-                data: first.clone(),
-            },
-        )
+        .at(ADV_PATH, Advertisement { data: adv.to_vec() })
         .await
         .map_err(|e| e.to_string())?;
     let path = ObjectPath::try_from(ADV_PATH).map_err(|e| e.to_string())?;
@@ -388,25 +382,7 @@ async fn advertise_on(
     let result = match registered {
         Err(e) => Err(format!("cannot advertise: {e}")),
         Ok(_) => {
-            let on_air = async {
-                tokio::time::sleep(first_hold).await;
-                let iface = server
-                    .interface::<_, Advertisement>(ADV_PATH)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for adv in &list[1..] {
-                    iface.get_mut().await.data = adv.clone();
-                    iface
-                        .get()
-                        .await
-                        .manufacturer_data_changed(iface.signal_emitter())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    tokio::time::sleep(each).await;
-                }
-                Ok::<(), String>(())
-            }
-            .await;
+            tokio::time::sleep(hold).await;
             let _ = sys
                 .call_method(
                     Some(BLUEZ),
@@ -416,7 +392,7 @@ async fn advertise_on(
                     &(&path,),
                 )
                 .await;
-            on_air
+            Ok(())
         }
     };
     let _ = server.remove::<Advertisement, _>(ADV_PATH).await;
@@ -556,21 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_starts_with_the_learned_one_and_covers_every_counter() {
-        let learned = parse_hex("7e8089b6a22f1cffffff3043524b544d").unwrap();
-        let s = sweep(&learned);
-        assert_eq!(s.len(), 256);
-        assert_eq!(s[0], learned);
-        assert_eq!(s[1][0], 0x7f);
-        assert_eq!(s[255][0], 0x7d);
-        let mut counters: Vec<u8> = s.iter().map(|a| a[0]).collect();
-        counters.sort();
-        counters.dedup();
-        assert_eq!(counters.len(), 256);
-        assert!(s.iter().all(|a| a[1..] == learned[1..]));
-    }
-
-    #[test]
     fn settings_are_checked_and_kept_per_receiver() {
         let mut all = Map::new();
         let id = "3f0c2a8e-9d1b-4c7e-8a55-0b6f2d9e1c47";
@@ -690,6 +651,7 @@ mod tests {
     #[derive(Default)]
     struct Seen {
         kind: String,
+        appearance: Option<u16>,
         first: Option<u8>,
         unregistered: bool,
     }
@@ -722,6 +684,9 @@ mod tests {
                 .get("Type")
                 .and_then(|v| String::try_from(v.try_clone().unwrap()).ok())
                 .unwrap_or_default();
+            seen.appearance = props
+                .get("Appearance")
+                .and_then(|v| u16::try_from(v.try_clone().unwrap()).ok());
             seen.first = mediatek_data(&props).map(|d| d[0]);
             Ok(())
         }
@@ -753,7 +718,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Every change of the advertisement while it is on the air, as BlueZ would follow it.
+        // Any change of the advertisement while it is on the air, as BlueZ would follow it: there must be none.
         let rule = MatchRule::builder()
             .msg_type(MsgType::Signal)
             .interface("org.freedesktop.DBus.Properties")
@@ -779,31 +744,18 @@ mod tests {
         });
 
         let learned = parse_hex(REMOTE).unwrap();
-        advertise_on(
-            &client,
-            &sweep(&learned),
-            Duration::from_millis(20),
-            Duration::from_millis(1),
-        )
-        .await
-        .unwrap();
-        let mut counters = counters.await.unwrap();
+        advertise_on(&client, &learned, Duration::from_millis(20))
+            .await
+            .unwrap();
+        let counters = counters.await.unwrap();
         {
             let seen = seen.lock().unwrap();
-            assert_eq!(seen.kind, "broadcast");
-            assert_eq!(
-                seen.first,
-                Some(0x7e),
-                "the learned advertisement goes first"
-            );
+            assert_eq!(seen.kind, "peripheral");
+            assert_eq!(seen.appearance, Some(KEYBOARD));
+            assert_eq!(seen.first, Some(0x7e), "the learned advertisement as it is");
             assert!(seen.unregistered);
         }
-        assert_eq!(counters.len(), 255, "{counters:?}");
-        assert_eq!(counters[0], 0x7f);
-        counters.push(0x7e);
-        counters.sort();
-        counters.dedup();
-        assert_eq!(counters.len(), 256, "every counter value was on the air");
+        assert!(counters.is_empty(), "no other counter value: {counters:?}");
 
         // Learning skips the unrelated device and keeps the remote's advertisement.
         assert_eq!(learn_on(&client, 5).await.unwrap(), learned);

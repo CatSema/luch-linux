@@ -322,9 +322,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             println!("waking {name} ({how}), waiting for it on the LAN…");
             let up = tokio::time::timeout(std::time::Duration::from_secs(90), async {
                 loop {
-                    if p.receivers()
+                    if known(&p, Some(id))
                         .await
-                        .is_ok_and(|rows| rows.iter().any(|row| row.0 == id))
+                        .is_ok_and(|(_, one)| one.is_some_and(|r| r["online"] == true))
                     {
                         return;
                     }

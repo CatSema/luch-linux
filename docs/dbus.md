@@ -174,8 +174,8 @@ remote signal).
 
 Turns a known receiver on from standby, every way known for it, and returns those ways (`wol,ble`). `wol`: a
 Wake-on-LAN magic packet to the MAC noted from the ARP table while the receiver was on. `ble`: the remote's power-key
-advertisement (Bluetooth company id 0x0046, MediaTek) through BlueZ on the system bus, first as learned for 1.5 s,
-then with each other value of its first byte (the remote's press counter): about 13 s in all. Fails when there is no
+advertisement (Bluetooth company id 0x0046, MediaTek) through BlueZ on the system bus, as learned, for 2 s, in a
+packet like the remote's own (connectable, discoverable, HID service, keyboard appearance). Fails when there is no
 way yet or none of them could be sent (no Bluetooth adapter, Bluetooth off). The receiver then appears through
 `ReceiversChanged`.
 

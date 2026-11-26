@@ -69,6 +69,17 @@ struct State {
 }
 type Shared = Arc<Mutex<State>>;
 
+/// Whether something accepts TCP at `address:port` within a second: tells a receiver that is on from one Avahi
+/// still lists after it went to standby.
+async fn answers(address: &str, port: u16) -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::TcpStream::connect((address, port)),
+    )
+    .await
+    .is_ok_and(|c| c.is_ok())
+}
+
 struct Luch {
     st: Shared,
     sender_id: String,
@@ -324,12 +335,33 @@ impl Luch {
     /// (unix time), `online` (on the LAN now), `wake` (the ways it can be turned on: "wol", "ble") and `hint` (what
     /// to do when there is none yet).
     async fn known(&self) -> String {
-        let st = self.st.lock().await;
-        let rows: Vec<Value> = wake::load()
+        // Avahi keeps a receiver for the record's TTL after it went to standby, so being found is not enough:
+        // one not connected must also answer on its port now.
+        let (found, connected) = {
+            let st = self.st.lock().await;
+            (
+                st.found.clone(),
+                st.conns.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let known = wake::load();
+        let probes = known.keys().map(|id| {
+            let target = found.get(id).filter(|_| !connected.contains(id)).cloned();
+            let up = found.contains_key(id);
+            async move {
+                match target {
+                    Some(r) => answers(&r.address, r.port).await,
+                    None => up,
+                }
+            }
+        });
+        let online = futures_util::future::join_all(probes).await;
+        let rows: Vec<Value> = known
             .into_iter()
-            .map(|(id, mut r)| {
+            .zip(online)
+            .map(|((id, mut r), online)| {
                 r["id"] = json!(id);
-                r["online"] = json!(st.found.contains_key(&id));
+                r["online"] = json!(online);
                 r["wake"] = json!(wake::methods(&r));
                 if let Some(h) = wake::hint(&r) {
                     r["hint"] = json!(h);
@@ -341,7 +373,7 @@ impl Luch {
     }
 
     /// Turns a known receiver on from standby, every way it can be (Wake-on-LAN, the remote's Bluetooth
-    /// advertisement); returns the ways tried, e.g. "wol,ble". Takes up to about 15 s with Bluetooth. The receiver
+    /// advertisement); returns the ways tried, e.g. "wol,ble". Takes about 2 s with Bluetooth. The receiver
     /// shows up in Receivers once it is up.
     async fn wake(&self, id: String) -> fdo::Result<String> {
         let r = wake::load()

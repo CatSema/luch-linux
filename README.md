@@ -158,8 +158,8 @@ tries every one it knows for that receiver:
 - *The remote's Bluetooth signal*, for projectors and TVs that leave the network in standby (XGIMI and other
   MediaTek-based Google TVs): with the receiver off, run `luchctl wake <r> learn` and press the power key on its
   remote near the computer. luchd then sends that signal itself (through BlueZ; the computer's Bluetooth must be
-  on and in range). The remote counts its presses, so luchd also sends the following counts, which takes about
-  13 s. The values can also be set by hand: `luchctl wake <r> mac <address>`, `luchctl wake <r> ble <hex>`.
+  on and in range), as the remote does it: a HID keyboard's advertisement for about 2 s. The values can also be set
+  by hand: `luchctl wake <r> mac <address>`, `luchctl wake <r> ble <hex>`.
 
 **Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md) (also `Info`,
 `SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Known`, `Wake`, `LearnWake`, `SetWake`).
