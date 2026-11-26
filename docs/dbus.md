@@ -139,6 +139,55 @@ Live numbers as JSON, refreshed every second while mirroring, `{}` otherwise:
 
 The same sender numbers are sent to the receiver (`sender_stats`) for its on-screen overlay.
 
+### `MirrorGroup(as ids, s source) → s`
+
+Starts one session shared by several receivers: the screen is captured once and encoded once, and
+each receiver gets the same encoded stream with its own transport and statistics. Receivers that are
+not connected yet are connected first. `source` is as in `Mirror`. Returns the group id (`g-…`).
+UDP (TV) and WebSocket (browser) receivers can be in the same group.
+
+### `MirrorGroupFps(as ids, s source, u fps) → s` / `MirrorAt(s id, s source, u fps)`
+
+Same as `MirrorGroup`/`Mirror` with the stream rate chosen for this group. Allowed values:
+
+- `0` — the screen's own rate, every captured frame (game streaming to one capable device);
+- `60` — default; a 144 Hz screen gives a uniform 48 fps (144 is not a multiple of 60);
+- `30` — for weak decoders or limited links.
+
+The rate is part of the group profile and is fixed at creation. Defaults come from `LUCH_FPS`
+(60). Other values are rejected: frames can only be selected from a fixed-refresh source, so
+they cannot be reproduced exactly without frame duplication.
+
+### `AddToGroup(s group_id, s receiver_id)`
+
+Puts an already connected receiver into a running group. The codec profile is fixed when the group is
+created: a HEVC group rejects a receiver that prefers H.264, an H.264 group accepts anyone. The
+receiver gets `start`, then streams from the shared encoder — no second capture.
+
+### `RemoveFromGroup(s group_id, s receiver_id)`
+
+Detaches one receiver (it gets `stop`); the others keep streaming. The group stops itself with its
+last receiver.
+
+### `StopGroup(s group_id)`
+
+Stops the whole group. `StopMirror(id)` is the same for the group that receiver belongs to.
+
+### `GroupStats(s group_id) → s`
+
+JSON, `{}` for an unknown group:
+
+- group: `id`, `source`, `codec`, `resolution`, `fps_target`, `receiver_count`, `receivers`,
+  `capture` (`playing`…), `capture_instances`, `transport` (subscriber counts);
+- `encoder`: `frames`, `bytes`, `live_instances`, `seq` (`video`/`audio`), `pacing_ms` (`avg`/`max`
+  spacing of published video frames — the objective smoothness number);
+- `receiver_stats[]`: `id`, `name`, `address`, `transport` (`udp`|`ws`), `connected`,
+  `state` (`streaming`|`lagging`|`awaiting_idr`), `frames`, `bytes`, `send_errors`, `dropped`
+  (refused at send), `skipped` (lag/withheld until a keyframe), `idr_requests`, `rate_mbps`,
+  `last_seq`, `rtt_ms`, `rx_stats` (the receiver's own `stats` message).
+
+`capture_instances` and `encoder.live_instances` are process-wide: one group must show 1 and 1.
+
 ### `Info(s id) → s`
 
 What a person should know about a receiver, as JSON: `android` (e.g. `Android 5.1`; empty until it has been
