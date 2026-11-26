@@ -40,6 +40,9 @@ jobs:
       - name: Test the browser extension's logic
         run: node --test browser-extension/test/*.test.js
 
+      - name: Test the GNOME extension
+        run: node --test gnome-extension/tests/*.mjs
+
       - name: Package
         run: |
           name=luch-linux-${GITHUB_REF_NAME//\//-}-x86_64

@@ -20,6 +20,9 @@ const IFACE = `<node>
     <method name="Stats"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="Known"><arg type="s" direction="out"/></method>
     <method name="Wake"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="Sleep"><arg name="id" type="s" direction="in"/></method>
+    <method name="Cast"><arg name="id" type="s" direction="in"/><arg name="items" type="as" direction="in"/><arg name="options" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="StopCast"><arg name="id" type="s" direction="in"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <signal name="ReceiversChanged"/>
   </interface>
@@ -46,6 +49,12 @@ const T = RU ? {
     webOpen: 'Открыть в браузере этого компьютера',
     turnOn: name => `Включить ${name}`,
     waking: name => `Включаю ${name}…`,
+    audio: 'Только звук (как колонка)',
+    sendFile: 'Показать файл…',
+    stopCast: 'Закрыть показанное',
+    turnOff: 'Выключить ТВ',
+    chooseFiles: 'Что показать на ТВ',
+    failed: name => `${name}: не получилось`,
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -62,7 +71,47 @@ const T = RU ? {
     webOpen: 'Open in this computer\u2019s browser',
     turnOn: name => `Turn on ${name}`,
     waking: name => `Turning on ${name}…`,
+    audio: 'Sound only (as a speaker)',
+    sendFile: 'Show a file…',
+    stopCast: 'Close what is shown',
+    turnOff: 'Turn the TV off',
+    chooseFiles: 'What to show on the TV',
+    failed: name => `${name}: that did not work`,
 };
+
+/** A D-Bus error's own message, without the "GDBus.Error:...: " prefix. */
+function reason(e) {
+    return String(e?.message ?? e).replace(/^GDBus\.Error:[^ ]+ /, '');
+}
+
+/** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
+function chooseFiles(title) {
+    return new Promise(resolve => {
+        let argv = null;
+        if (GLib.find_program_in_path('zenity'))
+            argv = ['zenity', '--file-selection', '--multiple', '--separator=\n', `--title=${title}`];
+        else if (GLib.find_program_in_path('kdialog'))
+            argv = ['kdialog', '--getopenfilename', GLib.get_home_dir(), '--multiple', '--separate-output', '--title', title];
+        if (!argv) {
+            resolve([]);
+            return;
+        }
+        try {
+            const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE);
+            proc.communicate_utf8_async(null, null, (p, res) => {
+                try {
+                    const [, out] = p.communicate_utf8_finish(res);
+                    resolve((out ?? '').split('\n').map(l => l.trim()).filter(Boolean));
+                } catch (e) {
+                    resolve([]);
+                }
+            });
+        } catch (e) {
+            logError(e, 'Luch: file dialog');
+            resolve([]);
+        }
+    });
+}
 
 const LuchToggle = GObject.registerClass(
 class LuchToggle extends QuickMenuToggle {
@@ -147,7 +196,11 @@ class LuchToggle extends QuickMenuToggle {
                 sub.icon.gicon = ICON;
             if (model)
                 sub.label.text = `${name} · ${model}`;
-            const add = (label, fn) => sub.menu.addAction(label, () => fn().catch(e => logError(e, 'Luch')));
+            // A refusal from luchd (an older receiver, the accessibility switch off...) is shown, not only logged.
+            const add = (label, fn) => sub.menu.addAction(label, () => fn().catch(e => {
+                logError(e, 'Luch');
+                Main.notify(T.failed(name), reason(e));
+            }));
             if (isMirroring) {
                 add(T.stop, () => this._proxy.StopMirrorAsync(id));
             } else {
@@ -155,7 +208,16 @@ class LuchToggle extends QuickMenuToggle {
                 add(T.monitor, () => this._mirror(id, 'monitor'));
                 add(T.window, () => this._mirror(id, 'window'));
                 add(T.extend, () => this._mirror(id, 'virtual'));
+                add(T.audio, () => this._mirror(id, 'audio'));
             }
+            add(T.sendFile, async () => {
+                const files = await chooseFiles(T.chooseFiles);
+                if (files.length > 0)
+                    await this._proxy.CastAsync(id, files, '');
+            });
+            if (connected)
+                add(T.stopCast, () => this._proxy.StopCastAsync(id));
+            add(T.turnOff, () => this._proxy.SleepAsync(id));
             if (connected)
                 add(T.disconnect, () => this._proxy.DisconnectAsync(id));
             this._section.addMenuItem(sub);
