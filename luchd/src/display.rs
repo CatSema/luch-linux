@@ -32,6 +32,14 @@ impl Size {
 /// Browsers send physical screen dimensions; older Android receivers advertise physical modes.
 pub fn native_size(welcome: &Value) -> Option<Size> {
     let display = &welcome["hw"]["display"];
+    // Android reports the size that already includes the current rotation; physical modes do not.
+    if let Some(size) = display["current"].as_str().and_then(|s| {
+        let resolution = s.split('@').next()?;
+        let (w, h) = resolution.split_once('x')?;
+        Size::new(w.parse().ok()?, h.parse().ok()?)
+    }) {
+        return Some(size);
+    }
     if let Some(size) = display["width"]
         .as_u64()
         .zip(display["height"].as_u64())
@@ -263,6 +271,20 @@ mod tests {
                 None
             );
         }
+    }
+    #[test]
+    fn prefers_current_rotation_over_physical_modes() {
+        let welcome = json!({"hw":{"display":{
+            "modes":["1840x2800@120","2800x1840@120"],
+            "current":"2800x1840@120"
+        }}});
+        assert_eq!(
+            native_size(&welcome),
+            Some(Size {
+                width: 2800,
+                height: 1840
+            })
+        );
     }
     fn monitor(name: &str, width: i32, height: i32) -> Monitor {
         let spec = (
