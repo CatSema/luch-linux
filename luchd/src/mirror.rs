@@ -791,11 +791,12 @@ fn pipeline(
     } else {
         String::new()
     };
-    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD (DCC), linear. LUCH_DRM_FORMAT overrides.
+    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD DCC, AMD 64KB tiled, linear.
+    // LUCH_DRM_FORMAT overrides.
     let drm = std::env::var("LUCH_DRM_FORMAT")
         .map(|d| format!("\"{d}\""))
         .unwrap_or_else(|_| {
-            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0\"}".into()
+            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0200000000082305\",\"NV12:0x0\"}".into()
         });
     // Zero copy: compositor DMA-BUF -> GPU conversion -> DMA-BUF -> VA-API encoder.
     let (width, height) = (size.width, size.height);
@@ -1314,7 +1315,7 @@ pub async fn run(
             _ => format!("pipeline: {e}"),
         });
     }
-    let virtual_monitor = if let Some(layout) = layout {
+    let virtual_monitor = if let Some(layout) = &layout {
         match layout.place_new_right(size).await {
             Ok(connector) => Some(connector),
             Err(e) => {
@@ -1395,6 +1396,13 @@ pub async fn run(
     if let Some((_sc, session, fd, _)) = portal {
         let _ = session.close().await;
         drop(fd);
+    }
+    // Removing the virtual monitor must not disturb the physical ones: restore the layout that
+    // was active before extend, once Mutter has dropped the virtual connector.
+    if let (Some(layout), Some(connector)) = (&layout, &virtual_monitor) {
+        if let Err(e) = layout.restore(connector).await {
+            eprintln!("[luchd] restore display layout: {e}");
+        }
     }
     why
 }
