@@ -39,9 +39,9 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 Sound (Opus, 5 ms frames) is captured from the default output in every mode. Any browser with WebCodecs
 (including compatible TV browsers) is also a receiver: open the HTTPS `WebUrl` the daemon serves
 (see `docs/dbus.md`), accept the local certificate and press Watch — handy where no Android receiver
-can be installed. Certificate trust support depends on the TV browser. Planned: media mode
-(send a URL/file and control playback like Chromecast), photo mode, presentation mode with a
-presenter view.
+can be installed. Certificate trust support depends on the TV browser. Videos, sounds and photos can also be *cast*:
+the receiver plays them itself in their own quality, like Chromecast (see **Use**). Planned: presentation mode with
+a presenter view.
 
 ## How it works
 
@@ -138,7 +138,21 @@ luchctl report 1 open                     # file one as an issue (or: report 1, 
 luchctl known                             # every receiver luchd has talked to, on or off, and how to wake it
 luchctl wake                              # turn a receiver on from standby and wait for it
 luchctl wake "XGIMI MoGo 4 Laser" learn   # pick up its remote's power signal over Bluetooth (receiver off)
+luchctl sleep                             # standby, as the remote's power key (needs Luch on in its accessibility settings)
+luchctl cast film.mkv film.en.srt         # the receiver plays it itself, in the file's own quality
+luchctl cast ~/Pictures/*.jpg             # photos: left and right on the remote go through them
+luchctl cast https://example.com/v.m3u8   # the receiver fetches the link; add --relay to fetch it through this computer
+luchctl media                             # what plays: position, speed, sound tracks, subtitles
+luchctl media pause                       # play | pause | toggle | seek 1:30 | skip -10 | rate 1.5 | audio a2 | sub s0 | sub off
+luchctl media watch                       # follow it, also changes made with the TV's remote
 ```
+
+**Casting.** A cast file is not mirrored: the receiver plays the original, picking the best version its screen can
+show, so a 4K file plays in 4K on a 4K TV even from a laptop with a 1080p screen, and the laptop can be closed (for
+a link) or stay free. The TV's remote controls it (OK pauses, left/right skip, down opens speed, sound track and
+subtitles); luchctl and the D-Bus API see the same state. Local files are served by luchd on TCP port 47810 to that
+receiver only; `--relay` passes a link through luchd too, for links only this computer can open (a company VPN, a
+site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS and HLS; DASH is not supported yet.
 
 **Sound on older receivers.** Android 5 and 6 cannot make the receiver's sound short: it trails the picture by
 its audio buffer (`luchctl info` says how much). `auto`, the default, then holds the picture back to match

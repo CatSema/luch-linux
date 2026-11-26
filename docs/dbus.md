@@ -190,7 +190,50 @@ connecting.
 Sets `kind` `mac` (`aa:bb:cc:dd:ee:ff`) or `ble` (the manufacturer data in hex, without the company id) by hand; an
 empty `value` forgets it.
 
+### `Cast(s id, as items, s options) → s`
+
+Shows on the receiver (connecting first if needed) local files or links, played or shown by the receiver itself in their
+own quality: a 4K file plays in 4K on a 4K TV whatever this screen is (PROTOCOL.md, section 4b). If every item is a
+picture they are photos (left/right on the remote goes through them); otherwise the first video or sound is played,
+with any subtitle files (`.srt`, `.vtt`) among the items. Returns `"media"` or `"photo"` once the receiver has taken
+it; fails with the receiver's reason (`bad_link`, `media_failed`, `busy`) otherwise.
+
+`options` is JSON or `""`: `title`, `start` (seconds), `paused`, `rate`, `subs` (paths or links), `mime` (for a link
+without an extension), `poster`, `via` and `headers`. A link is fetched by the receiver itself (`"via":"direct"`, the
+default; the computer may go to sleep meanwhile), with `headers` (only `Referer`, `User-Agent`, `Origin`, `Cookie`,
+`Authorization`). `"via":"sender"` relays it through luchd: luchd fetches it with those headers and passes the
+bytes on unchanged, rewriting HLS playlists to point back at itself. That is for links only this computer can reach:
+a company VPN, a site that needs the browser's login, Wi-Fi Direct. Local files always go through luchd.
+
+Files are served on TCP port 47810 (any free port if it is taken), each under a random token and only to the receiver
+it was cast to; open that port in a firewall. Nothing is served once the cast ends.
+
+### `MediaCmd(s id, s cmd)`
+
+Controls what the receiver plays: `cmd` is a `media_cmd` without `"t"`, as JSON: `{"do":"play"}`, `pause`, `toggle`,
+`{"do":"seek","pos":90}`, `{"do":"skip","by":-10}`, `{"do":"rate","rate":1.5}`, `{"do":"audio","id":"a2"}`,
+`{"do":"sub","id":"s0"}` (`null`: off), `{"do":"state"}` (report now).
+
+### `MediaState(s id) → s`
+
+The last `media_state` (JSON): `state` (`loading`, `playing`, `paused`, `ended`, `error`), `pos`, `dur` (null when
+live), `rate`, `w`/`h`, `tracks` (`audio`, `sub` with `id`, `label`), `sel`, `by` (`receiver` when changed on the TV).
+`{}` when nothing plays.
+
+### `StopCast(s id)`
+
+Ends what was cast (media or photos) and stops serving its files.
+
+### `Sleep(s id)`
+
+Puts the receiver to standby, as its remote's power key (PROTOCOL.md 4c). Fails with what is missing: the receiver's
+accessibility switch for Luch is off, or its Android is older than 9. `Wake` turns it on again.
+
 ## Signals
+
+### `MediaStateChanged(s id, s state)`
+
+Every `media_state` from a receiver, and `{"state":"stopped","reason":...}` when it ends.
 
 ### `ReceiversChanged()`
 

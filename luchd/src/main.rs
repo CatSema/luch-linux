@@ -1,6 +1,7 @@
 //! luchd — Luch v0 sender daemon: announces `_luchsrc._tcp`, browses `_luch._tcp`
 //! receivers via Avahi's D-Bus API, keeps control channels, mirrors the screen, exposes dev.luch.Luch1.
 
+mod cast;
 mod discovery;
 mod display;
 mod enc;
@@ -55,6 +56,9 @@ struct Conn {
     events: broadcast::Sender<Value>,
     /// Web receiver only: media frames (header + data) to its websocket writer task.
     media: Option<mpsc::Sender<Vec<u8>>>,
+    /// This machine's and the receiver's address on the control connection: what a receiver fetches cast files from,
+    /// and whom they are served to. None for the web receiver.
+    addrs: Option<(std::net::IpAddr, std::net::IpAddr)>,
 }
 
 #[derive(Default)]
@@ -66,6 +70,7 @@ struct State {
     welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
     audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
+    playing: HashMap<String, Value>, // id -> last media_state of what it plays for us (PROTOCOL.md 4b)
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -82,6 +87,8 @@ async fn answers(address: &str, port: u16) -> bool {
 
 struct Luch {
     st: Shared,
+    /// Serves cast files and relayed links to receivers; started on the first Cast.
+    files: Arc<tokio::sync::OnceCell<cast::Server>>,
     sender_id: String,
     host: String,
     discovery: discovery::Discovery,
@@ -137,11 +144,12 @@ impl Luch {
             .receiver(id.clone())
             .await
             .map_err(fdo::Error::Failed)?;
-        let (welcome, rd, wr) = handshake(&r, &self.sender_id, &self.host)
-            .await
-            .map_err(|e| {
-                fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
-            })?;
+        let (welcome, rd, wr, addrs) =
+            handshake(&r, &self.sender_id, &self.host)
+                .await
+                .map_err(|e| {
+                    fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
+                })?;
         let (tx, rx) = mpsc::channel(8);
         let (events, _) = broadcast::channel(16);
         {
@@ -152,6 +160,7 @@ impl Luch {
                     cmd: tx,
                     events: events.clone(),
                     media: None,
+                    addrs: Some(addrs),
                 },
             );
             st.welcomes.insert(id.clone(), welcome.clone());
@@ -446,8 +455,159 @@ impl Luch {
             .unwrap_or_default()
     }
 
+    /// Shows on a receiver (connecting first if needed) local files or links: photos (all items pictures) or one
+    /// video or sound, played by the receiver itself in its own quality (PROTOCOL.md 4b), with any subtitle files
+    /// among the items. `options`: JSON, may be "": `title`, `start` (s), `paused`, `rate`, `subs` (paths or
+    /// links), `via` ("direct": the receiver fetches a link itself, the default; "sender": luchd relays it, with
+    /// `headers`), `headers` (Referer, User-Agent, Origin, Cookie, Authorization), `mime`, `poster`.
+    /// Returns "media" or "photo" once the receiver has taken it.
+    async fn cast(
+        &self,
+        id: String,
+        items: Vec<String>,
+        options: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let o = cast::Options::parse(&options).map_err(fdo::Error::InvalidArgs)?;
+        if !self.st.lock().await.conns.contains_key(&id) {
+            self.connect(id.clone(), conn).await?;
+        }
+        let c = self.st.lock().await.conns.get(&id).cloned();
+        let c = c.ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+        let (me, tv) = c
+            .addrs
+            .ok_or_else(|| fdo::Error::NotSupported("the web receiver cannot play media".into()))?;
+        let srv = self
+            .files
+            .get_or_try_init(cast::Server::start)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("cannot serve files: {e}")))?;
+        let msg = cast::build(&items, &o, srv, tv, me).map_err(fdo::Error::InvalidArgs)?;
+        let kind = msg["t"].as_str().unwrap_or("").to_string();
+        let mut events = c.events.subscribe();
+        c.cmd
+            .send(Cmd::Send(msg))
+            .await
+            .map_err(|_| fdo::Error::Failed("channel closed".into()))?;
+        let answer = timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(v) if v["t"] == "media_ready" || v["t"] == "photo_ready" => return Ok(()),
+                    Ok(v)
+                        if v["t"] == "error"
+                            && v["for"] == kind.as_str()
+                            && v["code"] == "unknown" =>
+                    {
+                        return Err(format!(
+                            "this receiver version cannot show {kind} yet: update it"
+                        ))
+                    }
+                    Ok(v)
+                        if v["t"] == "error"
+                            && (v["for"] == kind.as_str() || v["for"].is_null()) =>
+                    {
+                        return Err(format!(
+                            "{}{}",
+                            v["code"].as_str().unwrap_or("error"),
+                            v["detail"]
+                                .as_str()
+                                .map(|d| format!(": {d}"))
+                                .unwrap_or_default()
+                        ))
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return Err("channel closed".to_string()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| fdo::Error::Failed("the receiver did not answer".into()))?;
+        answer.map_err(fdo::Error::Failed)?;
+        Ok(kind)
+    }
+
+    /// Asks the receiver about what it plays: `cmd` is a `media_cmd` (PROTOCOL.md 4b) without "t", as JSON:
+    /// {"do":"pause"}, {"do":"seek","pos":90}, {"do":"rate","rate":1.5}, {"do":"sub","id":null}...
+    async fn media_cmd(&self, id: String, cmd: String) -> fdo::Result<()> {
+        let mut v: Value =
+            serde_json::from_str(&cmd).map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
+        if !v["do"].is_string() {
+            return Err(fdo::Error::InvalidArgs("no \"do\"".into()));
+        }
+        v["t"] = json!("media_cmd");
+        self.send_to(&id, v).await
+    }
+
+    /// The last `media_state` from the receiver as JSON, "{}" when it plays nothing for us.
+    async fn media_state(&self, id: String) -> String {
+        self.st
+            .lock()
+            .await
+            .playing
+            .get(&id)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".into())
+    }
+
+    /// Ends what the receiver plays or shows for us (media or photos).
+    async fn stop_cast(&self, id: String) -> fdo::Result<()> {
+        self.send_to(&id, json!({"t": "stop"})).await?;
+        let addrs = self.st.lock().await.conns.get(&id).and_then(|c| c.addrs);
+        if let (Some(srv), Some((_, tv))) = (self.files.get(), addrs) {
+            srv.forget(tv);
+        }
+        Ok(())
+    }
+
+    /// Puts the receiver to standby (PROTOCOL.md 4c), connecting first if needed. Fails with the reason when the
+    /// receiver cannot: "off" (not turned on in its accessibility settings) or "no" (Android older than 9).
+    async fn sleep(&self, id: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        if !self.st.lock().await.conns.contains_key(&id) {
+            self.connect(id.clone(), conn).await?;
+        }
+        let c = self.st.lock().await.conns.get(&id).cloned();
+        let c = c.ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+        let mut events = c.events.subscribe();
+        let _ = c.cmd.send(Cmd::Send(json!({"t": "sleep"}))).await;
+        let r = timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Ok(v) if v["t"] == "sleeping" => return Ok(()),
+                    Ok(v) if v["t"] == "error" && v["for"] == "sleep" => {
+                        return Err(match v["sleep"].as_str() {
+                            Some("off") => "sleep is off on the receiver: turn on \"Luch\" in its accessibility settings".to_string(),
+                            Some("no") => "the receiver's Android is too old to be put to sleep (9 or newer)".to_string(),
+                            _ if v["code"] == "unknown" => "this receiver version cannot sleep yet: update it".to_string(),
+                            _ => v["code"].as_str().unwrap_or("error").to_string(),
+                        })
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return Ok(()), // the channel went with the TV: it is asleep
+                }
+            }
+        })
+        .await
+        .map_err(|_| fdo::Error::Failed("the receiver did not answer".into()))?;
+        r.map_err(fdo::Error::Failed)
+    }
+
     #[zbus(signal)]
     async fn receivers_changed(e: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
+    #[zbus(signal)]
+    async fn media_state_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
+}
+
+impl Luch {
+    async fn send_to(&self, id: &str, v: Value) -> fdo::Result<()> {
+        let c = self.st.lock().await.conns.get(id).cloned();
+        let c = c.ok_or_else(|| fdo::Error::InvalidArgs(format!("not connected: {id}")))?;
+        c.cmd
+            .send(Cmd::Send(v))
+            .await
+            .map_err(|_| fdo::Error::Failed("channel closed".into()))
+    }
 }
 
 async fn changed(conn: &Connection) {
@@ -493,7 +653,12 @@ async fn handshake(
     r: &Receiver,
     id: &str,
     host: &str,
-) -> io::Result<(Value, Reader, OwnedWriteHalf)> {
+) -> io::Result<(
+    Value,
+    Reader,
+    OwnedWriteHalf,
+    (std::net::IpAddr, std::net::IpAddr),
+)> {
     let addr: SocketAddr = format!("{}:{}", r.address, r.port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -502,6 +667,7 @@ async fn handshake(
     let stream = timeout(HANDSHAKE_TIMEOUT, sock.connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+    let addrs = (stream.local_addr()?.ip(), stream.peer_addr()?.ip());
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
     let hello = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
@@ -517,7 +683,7 @@ async fn handshake(
             format!("expected welcome, got {welcome}"),
         ));
     }
-    Ok((welcome, rd, wr))
+    Ok((welcome, rd, wr, addrs))
 }
 
 async fn run_channel(
@@ -597,7 +763,21 @@ async fn run_channel(
                         eprintln!("[luchd] {name}: error {v}");
                         let _ = events.send(v);
                     }
-                    "ready" | "keyframe" | "stop" | "stats" => {
+                    "ready" | "keyframe" | "stats" | "media_ready" | "photo_ready" | "sleeping" => {
+                        let _ = events.send(v);
+                    }
+                    "stop" => {
+                        // What it played for us is over: its files are no longer served.
+                        let was_playing = st.lock().await.playing.remove(&id).is_some();
+                        if was_playing {
+                            media_changed(&conn, &id, &json!({"t": "media_state", "state": "stopped",
+                                                               "reason": v["reason"]})).await;
+                        }
+                        let _ = events.send(v);
+                    }
+                    "media_state" => {
+                        st.lock().await.playing.insert(id.clone(), v.clone());
+                        media_changed(&conn, &id, &v).await;
                         let _ = events.send(v);
                     }
                     "reports" => {
@@ -628,8 +808,18 @@ async fn run_channel(
     reader.abort();
     let _ = wr.shutdown().await;
     eprintln!("[luchd] {name}: channel closed ({why})");
-    st.lock().await.conns.remove(&id);
+    {
+        let mut s = st.lock().await;
+        s.conns.remove(&id);
+        s.playing.remove(&id);
+    }
     changed(&conn).await;
+}
+
+async fn media_changed(conn: &Connection, id: &str, state: &Value) {
+    if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
+        let _ = Luch::media_state_changed(&e, id, &state.to_string()).await;
+    }
 }
 
 // ---------- mirroring ----------
@@ -746,11 +936,7 @@ async fn start_mirror(
     let (st, conn, id) = (st.clone(), conn.clone(), id.to_string());
     // Subscribe here and drop our copy of the sender: the mirror must see the channel close
     // (receiver gone or restarted) instead of streaming into the void.
-    let Conn {
-        cmd,
-        events,
-        media: _,
-    } = c;
+    let Conn { cmd, events, .. } = c;
     let events_rx = events.subscribe();
     drop(events);
     let name = target.name.clone();
@@ -1000,6 +1186,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 cmd: cmd_tx.clone(),
                 events: events.clone(),
                 media: Some(media_tx),
+                addrs: None,
             },
         );
     }
@@ -1348,6 +1535,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             p::DBUS_PATH,
             Luch {
                 st: st.clone(),
+                files: Arc::default(),
                 sender_id: id.clone(),
                 host: host.clone(),
                 discovery,

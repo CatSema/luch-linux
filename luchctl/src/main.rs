@@ -25,18 +25,29 @@ trait Luch1 {
     fn wake(&self, id: &str) -> zbus::Result<String>;
     fn learn_wake(&self, id: &str, seconds: u32) -> zbus::Result<String>;
     fn set_wake(&self, id: &str, kind: &str, value: &str) -> zbus::Result<()>;
+    fn cast(&self, id: &str, items: &[String], options: &str) -> zbus::Result<String>;
+    fn media_cmd(&self, id: &str, cmd: &str) -> zbus::Result<()>;
+    fn media_state(&self, id: &str) -> zbus::Result<String>;
+    fn stop_cast(&self, id: &str) -> zbus::Result<()>;
+    fn sleep(&self, id: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn media_state_changed(&self, id: &str, state: &str) -> zbus::Result<()>;
     #[zbus(property)]
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
 const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
-                | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off]
+                | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
+                | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
+                | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
-       `wake <r> learn` picks up while you press the remote's power key with the receiver off)";
+       `wake <r> learn` picks up while you press the remote's power key with the receiver off)
+       cast: photos, or a video or sound the receiver plays itself in its own quality; a link is fetched by the
+       receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -144,7 +155,16 @@ async fn run(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let p = Luch1Proxy::new(&conn).await.map_err(|e| e.to_string())?;
-    let e = |e: zbus::Error| format!("{e} (is luchd running?)");
+    // luchd's own refusals as they are; "is luchd running?" only when nobody answered.
+    let e = |e: zbus::Error| match &e {
+        zbus::Error::MethodError(name, Some(detail), _)
+            if !name.as_str().contains("ServiceUnknown")
+                && !name.as_str().contains("NameHasNoOwner") =>
+        {
+            detail.clone()
+        }
+        _ => format!("{e} (is luchd running?)"),
+    };
     match args
         .iter()
         .map(String::as_str)
@@ -192,10 +212,52 @@ async fn run(args: &[String]) -> Result<(), String> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        ["stop", key @ ..] if key.len() <= 1 => p
-            .stop_mirror(&find_id(&p, key.first().copied()).await?)
-            .await
-            .map_err(e)?,
+        ["stop", key @ ..] if key.len() <= 1 => {
+            let id = find_id(&p, key.first().copied()).await?;
+            // Mirroring, or else whatever was cast.
+            if p.stop_mirror(&id).await.is_err() {
+                p.stop_cast(&id).await.map_err(e)?;
+            }
+        }
+        ["sleep", key @ ..] if key.len() <= 1 => {
+            p.sleep(&find_id(&p, key.first().copied()).await?)
+                .await
+                .map_err(e)?;
+        }
+        ["cast", rest @ ..] if !rest.is_empty() => {
+            let (key, rest) = match rest {
+                [k, more @ ..] if !more.is_empty() && !looks_like_item(k) => (Some(*k), more),
+                _ => (None, rest),
+            };
+            let (items, options) = cast_args(rest)?;
+            let id = find_id(&p, key).await?;
+            let kind = p.cast(&id, &items, &options.to_string()).await.map_err(e)?;
+            println!("{kind} on the receiver; `luchctl media` follows it");
+        }
+        ["media", rest @ ..] => {
+            let (key, words) = match rest {
+                [k, more @ ..] if !MEDIA_WORDS.contains(k) => (Some(*k), more),
+                _ => (None, rest),
+            };
+            let id = find_id(&p, key).await?;
+            match words {
+                [] => println!("{}", state_line(&p.media_state(&id).await.map_err(e)?)),
+                ["watch"] => {
+                    let mut changes = p.receive_media_state_changed().await.map_err(e)?;
+                    println!("{}", state_line(&p.media_state(&id).await.map_err(e)?));
+                    while let Some(c) = changes.next().await {
+                        let Ok(a) = c.args() else { continue };
+                        if a.id == id {
+                            println!("{}", state_line(a.state));
+                        }
+                    }
+                }
+                w => p
+                    .media_cmd(&id, &media_command(w)?.to_string())
+                    .await
+                    .map_err(e)?,
+            }
+        }
         ["info", key @ ..] if key.len() <= 1 => {
             let id = find_id(&p, key.first().copied()).await?;
             let v: serde_json::Value =
@@ -372,6 +434,136 @@ async fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+const MEDIA_WORDS: [&str; 12] = [
+    "play", "pause", "toggle", "seek", "skip", "rate", "speed", "audio", "sub", "state", "watch",
+    "off",
+];
+
+fn looks_like_item(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://") || std::path::Path::new(s).exists()
+}
+
+/// Items and the Cast options JSON from `cast` arguments.
+fn cast_args(args: &[&str]) -> Result<(Vec<String>, serde_json::Value), String> {
+    let mut items = Vec::new();
+    let mut o = serde_json::json!({});
+    let mut subs = Vec::new();
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or(format!("{a} needs a value"));
+        match a {
+            "--title" => o["title"] = value()?.into(),
+            "--start" => o["start"] = parse_time(value()?)?.into(),
+            "--sub" => subs.push(absolute(value()?)),
+            "--relay" => o["via"] = "sender".into(),
+            "--paused" => o["paused"] = true.into(),
+            a if a.starts_with("--") => return Err(format!("unknown option {a}")),
+            a => items.push(absolute(a)),
+        }
+    }
+    if items.is_empty() {
+        return Err("cast what? a file or a link".into());
+    }
+    if !subs.is_empty() {
+        o["subs"] = subs.into();
+    }
+    Ok((items, o))
+}
+
+/// A path as luchd sees it (it runs elsewhere): absolute; links stay as they are.
+fn absolute(s: &str) -> String {
+    if s.contains("://") {
+        return s.to_string();
+    }
+    std::fs::canonicalize(s)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| s.to_string())
+}
+
+/// "90", "1:30" or "1:02:03" in seconds.
+fn parse_time(s: &str) -> Result<f64, String> {
+    let mut total = 0.0;
+    for part in s.split(':') {
+        total = total * 60.0
+            + part
+                .parse::<f64>()
+                .map_err(|_| format!("not a time: {s}"))?;
+    }
+    Ok(total)
+}
+
+/// The media_cmd for `media` words (PROTOCOL.md 4b).
+fn media_command(words: &[&str]) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let num = |w: Option<&&str>| -> Result<f64, String> {
+        w.ok_or("a number is missing")?
+            .parse::<f64>()
+            .map_err(|_| "not a number".to_string())
+    };
+    Ok(match words {
+        [w @ ("play" | "pause" | "toggle" | "state")] => json!({"do": w}),
+        ["seek", t] => json!({"do": "seek", "pos": parse_time(t)?}),
+        ["skip", rest @ ..] => json!({"do": "skip", "by": num(rest.first())?}),
+        ["rate" | "speed", rest @ ..] => json!({"do": "rate", "rate": num(rest.first())?}),
+        ["audio", id] => json!({"do": "audio", "id": id}),
+        ["sub", "off"] => json!({"do": "sub", "id": null}),
+        ["sub", id] => json!({"do": "sub", "id": id}),
+        _ => return Err(USAGE.into()),
+    })
+}
+
+fn clock(s: f64) -> String {
+    let s = s.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// One human line from a media_state.
+fn state_line(json: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let Some(state) = v["state"].as_str() else {
+        return "(nothing playing)".into();
+    };
+    let mut line = state.to_string();
+    if let Some(pos) = v["pos"].as_f64() {
+        line += &format!(" {}", clock(pos));
+        if let Some(d) = v["dur"].as_f64() {
+            line += &format!(" / {}", clock(d));
+        }
+    }
+    if let Some(r) = v["rate"].as_f64().filter(|r| (*r - 1.0).abs() > 0.001) {
+        line += &format!(" · {r}x");
+    }
+    if let (Some(w), Some(h)) = (v["w"].as_u64(), v["h"].as_u64()) {
+        line += &format!(" · {w}x{h}");
+    }
+    for (kind, word) in [("audio", "sound"), ("sub", "subtitles")] {
+        let list: Vec<String> = v["tracks"][kind]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                let id = t["id"].as_str().unwrap_or("");
+                let mark = if v["sel"][kind] == id { "*" } else { "" };
+                format!("{mark}{id} {}", t["label"].as_str().unwrap_or(""))
+            })
+            .collect();
+        if !list.is_empty() {
+            line += &format!(" · {word}: {}", list.join(", "));
+        }
+    }
+    if v["by"] == "receiver" {
+        line += " (on the TV)";
+    }
+    if let Some(d) = v["detail"].as_str() {
+        line += &format!(" · {d}");
+    }
+    line
+}
+
 /// One human line from the daemon's Stats JSON.
 fn stats_line(json: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
@@ -486,5 +678,49 @@ async fn main() {
     if let Err(msg) = run(&args).await {
         eprintln!("luchctl: {msg}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_arguments() {
+        let (items, o) = cast_args(&[
+            "https://x.example/a.m3u8",
+            "--start",
+            "1:30",
+            "--relay",
+            "--title",
+            "A",
+        ])
+        .unwrap();
+        assert_eq!(items, vec!["https://x.example/a.m3u8"]);
+        assert_eq!(o["start"], 90.0);
+        assert_eq!(o["via"], "sender");
+        assert_eq!(o["title"], "A");
+        assert!(cast_args(&["--paused"]).is_err());
+        assert!(cast_args(&["a.mp4", "--title"]).is_err());
+    }
+
+    #[test]
+    fn media_words() {
+        assert_eq!(media_command(&["seek", "2:00"]).unwrap()["pos"], 120.0);
+        assert_eq!(
+            media_command(&["sub", "off"]).unwrap()["id"],
+            serde_json::Value::Null
+        );
+        assert!(media_command(&["fly"]).is_err());
+    }
+
+    #[test]
+    fn state_lines() {
+        let s = r#"{"state":"playing","pos":75.2,"dur":3600,"rate":1.5,"w":3840,"h":2160,"by":"receiver",
+            "tracks":{"audio":[{"id":"a1","label":"English"},{"id":"a2","label":"Русский"}],"sub":[]},
+            "sel":{"audio":"a2","sub":null}}"#;
+        assert_eq!(state_line(s),
+            "playing 1:15 / 1:00:00 · 1.5x · 3840x2160 · sound: a1 English, *a2 Русский (on the TV)");
+        assert_eq!(state_line("{}"), "(nothing playing)");
     }
 }
