@@ -621,6 +621,9 @@ pub struct Options {
     /// The kind of a link without an extension, from the page ("video/mp4", "application/vnd.apple.mpegurl").
     pub mime: Option<String>,
     pub poster: Option<String>,
+    /// The same video in several qualities, best first: [{url, mime, w, h}] (a page's 360/720/1080 files). The
+    /// receiver plays the best its screen shows; the first item is then only the fallback.
+    pub sources: Vec<Value>,
 }
 
 impl Options {
@@ -637,6 +640,16 @@ impl Options {
             rate: v["rate"].as_f64(),
             mime: v["mime"].as_str().map(String::from),
             poster: v["poster"].as_str().map(String::from),
+            sources: v["sources"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|s| s["url"].as_str().is_some_and(is_url))
+                        .take(12)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
             ..Default::default()
         };
         if let Some(via) = &o.via {
@@ -855,7 +868,27 @@ pub fn build(
     if !mime.is_empty() {
         src["mime"] = json!(mime);
     }
-    let mut msg = json!({"t": "media", "via": via, "src": [src], "title": title});
+    let mut list = Vec::new();
+    for s in &o.sources {
+        // Every quality travels the way the first one does.
+        let u = s["url"].as_str().unwrap_or_default();
+        let m = s["mime"].as_str().unwrap_or(&mime).to_string();
+        let (link, _) = share_one(u, &m, via == "sender", o, srv, client, me)?;
+        let mut e = json!({"url": link});
+        if !m.is_empty() {
+            e["mime"] = json!(m);
+        }
+        for k in ["w", "h", "codec"] {
+            if !s[k].is_null() {
+                e[k] = s[k].clone();
+            }
+        }
+        list.push(e);
+    }
+    if list.is_empty() {
+        list.push(src);
+    }
+    let mut msg = json!({"t": "media", "via": via, "src": list, "title": title});
     if o.start > 0.0 {
         msg["start"] = json!(o.start);
     }
@@ -1335,6 +1368,21 @@ mod tests {
             .unwrap()
             .starts_with("http://192.168.1.20:"));
         assert!(r.get("headers").is_none());
+
+        // Several qualities of a page's video: all go, sizes kept, relayed alike.
+        let q = Options::parse(
+            r#"{"via":"sender","sources":[{"url":"https://cdn.example/720/a.mp4","h":720,"w":1280},
+                {"url":"https://cdn.example/360/a.mp4","h":360,"w":640},{"url":"file:///etc/passwd"}]}"#,
+        )
+        .unwrap();
+        let m = build(&["https://cdn.example/360/a.mp4".into()], &q, &srv, tv, me).unwrap();
+        let src = m["src"].as_array().unwrap();
+        assert_eq!(src.len(), 2, "{m}");
+        assert_eq!(src[0]["h"], 720);
+        assert!(src[0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://192.168.1.20:"));
 
         let a = temp_file("a.jpg", b"j");
         let b = a.with_file_name("b.png");

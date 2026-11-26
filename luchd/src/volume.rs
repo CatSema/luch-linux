@@ -3,7 +3,6 @@
 //! sink, and luchd moves the TV's volume a step up or down with them. PipeWire's null sink monitor is taken before its volume, so the sound
 //! itself is not turned down twice.
 
-
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 

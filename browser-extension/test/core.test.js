@@ -82,3 +82,32 @@ test("clock and position between reports", () => {
   assert.equal(c.positionNow(s, 1000, 9000), 12);
   assert.equal(c.positionNow({ state: "paused", pos: 5 }, 0, 99999), 5);
 });
+
+test("the quality a link names, and its siblings", () => {
+  assert.equal(c.qualityOf("https://cdn.example/v/720/1234.mp4"), 720);
+  assert.equal(c.qualityOf("https://cdn.example/v/1234_480p.mp4"), 480);
+  assert.equal(c.qualityOf("https://cdn.example/v/1234.mp4?q=1080&t=1"), 1080);
+  assert.equal(c.qualityOf("https://cdn.example/v/episode-7201.mp4"), 0);
+  assert.equal(c.qualityOf("https://cdn.example/v/1234.mp4"), 0);
+  const v = c.variantLinks("https://cdn.example/v/360/1234.mp4?token=a");
+  assert.ok(v.some((x) => x.url === "https://cdn.example/v/720/1234.mp4?token=a" && x.h === 720));
+  assert.ok(v.some((x) => x.url === "https://cdn.example/v/1080/1234.mp4?token=a"));
+  assert.ok(!v.some((x) => x.h === 360));
+  const p = c.variantLinks("https://cdn.example/v/1234_360p.mp4");
+  assert.ok(p.some((x) => x.url === "https://cdn.example/v/1234_720p.mp4"));
+  assert.deepEqual(c.variantLinks("https://cdn.example/v/1234.mp4"), []);
+});
+
+test("sources go best first with their sizes", () => {
+  const s = c.sourcesOf("https://cdn.example/360/a.mp4", "video/mp4",
+    [{ url: "https://cdn.example/720/a.mp4", h: 720 }, { url: "https://cdn.example/480/a.mp4", h: 480 }]);
+  assert.deepEqual(s.map((x) => x.h), [720, 480, 360]);
+  assert.equal(s[0].w, 1280);
+  assert.equal(s[0].mime, "video/mp4");
+});
+
+test("subtitle files are told apart", () => {
+  assert.ok(c.isSubtitle("https://x.example/subs/ep1.ass"));
+  assert.ok(c.isSubtitle("https://x.example/s?id=1", "text/vtt; charset=utf-8"));
+  assert.ok(!c.isSubtitle("https://x.example/a.mp4"));
+});

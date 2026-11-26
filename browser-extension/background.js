@@ -9,8 +9,15 @@ const HOST = "dev.luch.host";
 // ---- media links seen per tab (a blob: player's real source) ----------------------------------------------
 
 const seen = new Map(); // tabId -> [{url, kind, type}], oldest first, at most 40
+const subsSeen = new Map(); // tabId -> subtitle links the page loaded (VTT, SRT, ASS)
 function remember(tabId, url, type) {
   if (tabId < 0) return;
+  if (LuchCore.isSubtitle(url, type)) {
+    const subs = subsSeen.get(tabId) || [];
+    if (!subs.includes(url)) subs.push(url);
+    subsSeen.set(tabId, subs.slice(-8));
+    return;
+  }
   const kind = LuchCore.kindOf(url, type);
   if (!kind) return;
   if (kind === "file" && /\.(ts|m4s|aac)(\?|$)/i.test(url)) return; // segments of a playlist, not a file to cast
@@ -30,9 +37,34 @@ B.webRequest.onHeadersReceived.addListener(
 );
 B.webNavigation &&
   B.webNavigation.onCommitted.addListener((d) => {
-    if (d.frameId === 0) seen.delete(d.tabId);
+    if (d.frameId === 0) {
+      seen.delete(d.tabId);
+      subsSeen.delete(d.tabId);
+    }
   });
-B.tabs.onRemoved.addListener((tabId) => seen.delete(tabId));
+B.tabs.onRemoved.addListener((tabId) => {
+  seen.delete(tabId);
+  subsSeen.delete(tabId);
+});
+
+/** Which of a file's sibling qualities exist: a 1-byte request each, 3 s at most for all. */
+async function probeVariants(url) {
+  const tries = LuchCore.variantLinks(url).map(async (v) => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 3000);
+    try {
+      const r = await fetch(v.url, { headers: { Range: "bytes=0-0" }, credentials: "include", signal: ctl.signal });
+      const type = r.headers.get("content-type") || "";
+      return (r.status === 206 || r.status === 200) && !/text\/html/i.test(type) ? v : null;
+    } catch (e) {
+      return null;
+    } finally {
+      clearTimeout(t);
+      ctl.abort();
+    }
+  });
+  return (await Promise.all(tries)).filter(Boolean);
+}
 
 // ---- the native host -----------------------------------------------------------------------------------
 
@@ -154,14 +186,35 @@ async function castFromTab(tabId, req) {
   const { relay, trusted = [] } = await B.storage.local.get(["relay", "trusted"]);
   const via = LuchCore.chooseVia(src.url, relay);
   const trust = trusted.includes(receiver);
-  const request = Object.assign({}, req.page, { url: src.url, mime: src.mime, via, trusted: trust });
+  // A page's player with one file per quality: its siblings go too, so the TV plays the best its screen shows.
+  const sources = src.kind === "file" ? LuchCore.sourcesOf(src.url, src.mime, await probeVariants(src.url)) : [];
+  const subs = [...new Set([...(req.page.subs || []), ...(subsSeen.get(tabId) || [])])];
+  const request = Object.assign({}, req.page, { url: src.url, mime: src.mime, via, trusted: trust, subs });
   const cookie = via === "sender" || trust ? await cookieFor(src.url) : "";
   const options = LuchCore.castOptions(Object.assign({}, request, { cookie }));
-  casts.set(receiver, { tabId, via, request, state: null, retried: false });
+  if (sources.length > 1) options.sources = sources;
+  casts.set(receiver, { tabId, via, request, sources, state: null, retried: false });
   await ask("cast", { receiver, items: [src.url], options });
   await B.storage.local.set({ receiver });
   const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
-  return { receiver, name, via, kind: src.kind };
+  return { receiver, name, via, kind: src.kind, url: src.url, qualities: sources.map((s) => ({ url: s.url, h: s.h })) };
+}
+
+/**
+ * The same video again from where the TV is: another quality chosen in the panel (`url`, or null for the best),
+ * or the page's player switched to another file.
+ */
+async function recast(receiver, url, start) {
+  const c = casts.get(receiver);
+  if (!c) throw new Error("nothing cast to that receiver");
+  const target = url || c.request.url;
+  const request = Object.assign({}, c.request, { url: target, currentTime: start, paused: false });
+  const cookie = c.via === "sender" || request.trusted ? await cookieFor(target) : "";
+  const options = LuchCore.castOptions(Object.assign({}, request, { via: c.via, cookie }));
+  if (!url && c.sources.length > 1) options.sources = c.sources;
+  c.request = request;
+  await ask("cast", { receiver, items: [target], options });
+  return {};
 }
 
 B.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -182,6 +235,8 @@ B.runtime.onMessage.addListener((msg, sender, reply) => {
       }
       case "cast":
         return castFromTab(tabId, msg);
+      case "recast":
+        return recast(msg.receiver, msg.url || null, msg.start || 0);
       case "cmd":
         await ask("cmd", { receiver: msg.receiver, cmd: msg.cmd });
         return {};

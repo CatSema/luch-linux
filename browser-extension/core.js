@@ -174,7 +174,73 @@
     return typeof state.dur === "number" ? Math.min(p, state.dur) : p;
   }
 
-  const api = { kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const QUALITIES = [144, 240, 360, 480, 540, 576, 720, 1080, 1440, 2160, 4320];
+  // A quality in a link: "720p", "/720/", "_720.", "-1080-", "=480&": a known height between separators.
+  const Q_RE = /(^|[\/_\-.=])(144|240|360|480|540|576|720|1080|1440|2160|4320)(p?)(?=$|[\/_\-.?&=])/i;
+
+  /** The video height a link names, or 0. */
+  function qualityOf(url) {
+    let path;
+    try {
+      const u = new URL(url);
+      path = u.pathname + u.search;
+    } catch (e) {
+      return 0;
+    }
+    const m = path.match(Q_RE);
+    return m ? Number(m[2]) : 0;
+  }
+
+  /** The same link with another quality in place of the one it names; [] when it names none. */
+  function variantLinks(url) {
+    const q = qualityOf(url);
+    if (!q) return [];
+    let u;
+    try {
+      u = new URL(url);
+    } catch (e) {
+      return [];
+    }
+    const path = u.pathname + u.search;
+    const m = path.match(Q_RE);
+    const at = m.index + m[1].length;
+    const out = [];
+    for (const other of QUALITIES) {
+      if (other === q) continue;
+      const replaced = path.slice(0, at) + other + m[3] + path.slice(at + String(q).length + m[3].length);
+      out.push({ url: u.origin + replaced, h: other });
+    }
+    return out;
+  }
+
+  /**
+   * The cast's sources, best first: the link itself and the variants that answered ([{url, h}]), each with its size
+   * (16:9 assumed) so the receiver can pick what its screen shows.
+   */
+  function sourcesOf(url, mime, found) {
+    const all = [{ url, h: qualityOf(url) }].concat(found || []);
+    const seen = new Set();
+    return all
+      .filter((s) => !seen.has(s.url) && seen.add(s.url))
+      .sort((a, b) => b.h - a.h)
+      .map((s) => {
+        const o = { url: s.url };
+        if (mime) o.mime = mime;
+        if (s.h) {
+          o.h = s.h;
+          o.w = Math.round((s.h * 16) / 9);
+        }
+        return o;
+      });
+  }
+
+  /** "subtitles" for a link the page loaded: WebVTT, SubRip or ASS by its extension or type. */
+  function isSubtitle(url, type) {
+    const c = (type || "").toLowerCase();
+    return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
+  }
+
+  const api = { qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

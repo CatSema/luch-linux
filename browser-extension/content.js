@@ -8,10 +8,10 @@
   const T = RU
     ? { cast: "На ТВ", on: "Играет на", stop: "Остановить", speed: "Скорость", sound: "Звук", subs: "Субтитры",
         off: "Выкл.", choose: "Куда показать?", relay: "ТВ не смог открыть ссылку сам — идёт через этот компьютер",
-        loading: "Загрузка…", paused: "Пауза", ended: "Закончилось" }
+        loading: "Загрузка…", paused: "Пауза", ended: "Закончилось", quality: "Качество", best: "лучшее для ТВ" }
     : { cast: "To TV", on: "Playing on", stop: "Stop", speed: "Speed", sound: "Sound", subs: "Subtitles",
         off: "Off", choose: "Show it where?", relay: "The TV could not open the link itself: it goes through this computer",
-        loading: "Loading…", paused: "Paused", ended: "Ended" };
+        loading: "Loading…", paused: "Paused", ended: "Ended", quality: "Quality", best: "best for the TV" };
   const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   const send = (msg) => new Promise((res) => B.runtime.sendMessage(msg, (r) => res(r || { ok: false, error: "no answer" })));
@@ -54,6 +54,7 @@
       <select class="rate"></select>
       <select class="audio"></select>
       <select class="sub"></select>
+      <select class="quality"></select>
       <button class="c stop"></button>
     </div>
   </div>
@@ -118,6 +119,8 @@
     if (!r.ok) return toast(r.error);
     if (r.choose) return chooseThen(v, r.choose);
     start(v, r.receiver, r.name);
+    cast.src = r.url;
+    qualities(r.qualities || []);
   }
 
   function chooseThen(v, list) {
@@ -152,8 +155,27 @@
   }
 
   /** The page's own video stays paused and silent; its play button asks the TV instead. */
+  /** The panel's quality list: "best for the TV" (the receiver picks) and each file the page has. */
+  function qualities(list) {
+    const sel = $(".quality");
+    sel.innerHTML = "";
+    sel.add(new Option(`${T.quality}: ${T.best}`, ""));
+    for (const q of list) if (q.h) sel.add(new Option(`${T.quality}: ${q.h}p`, q.url));
+    sel.style.display = list.length > 1 ? "" : "none";
+  }
+
+  /** The page's player switched files (another quality, the next episode): the TV follows, from where it is. */
+  function onPageSource(e) {
+    if (!cast || e.target !== cast.video) return;
+    const url = cast.video.currentSrc;
+    if (!/^https?:/.test(url) || url === cast.src) return;
+    cast.src = url;
+    send({ op: "recast", receiver: cast.receiver, url, start: LuchCore_position() });
+  }
+
   function holdPage(v) {
     v.pause();
+    v.addEventListener("loadedmetadata", onPageSource, true);
     v.dataset.luchMuted = v.muted ? "1" : "0";
     v.muted = true;
     v.addEventListener("play", onPagePlay, true);
@@ -167,6 +189,7 @@
     if (!cast) return;
     const v = cast.video;
     v.removeEventListener("play", onPagePlay, true);
+    v.removeEventListener("loadedmetadata", onPageSource, true);
     v.muted = v.dataset.luchMuted === "1";
     // Take up where the TV left off.
     const pos = LuchCore_position();
@@ -239,6 +262,12 @@
   $(".rate").onchange = () => cmd({ do: "rate", rate: Number($(".rate").value) });
   $(".audio").onchange = () => cmd({ do: "audio", id: $(".audio").value });
   $(".sub").onchange = () => cmd({ do: "sub", id: $(".sub").value || null });
+  $(".quality").onchange = () => {
+    if (!cast) return;
+    const url = $(".quality").value || null;
+    if (url) cast.src = url;
+    send({ op: "recast", receiver: cast.receiver, url, start: LuchCore_position() });
+  };
   $(".stop").onclick = () => {
     if (!cast) return;
     send({ op: "stop", receiver: cast.receiver });
