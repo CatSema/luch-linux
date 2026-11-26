@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// The extension's decisions, without the browser: what a link is, which one to cast, whether the TV can fetch it
+// itself or this computer has to pass it on. Loaded by the background (importScripts / background.scripts) and by
+// the tests under Node.
+(function (root) {
+  "use strict";
+
+  const MIME = {
+    hls: "application/vnd.apple.mpegurl",
+    dash: "application/dash+xml",
+  };
+
+  const FILE_TYPES = {
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/mp4", webm: "video/webm", mkv: "video/x-matroska",
+    ts: "video/mp2t", mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", oga: "audio/ogg",
+    opus: "audio/ogg", flac: "audio/flac", wav: "audio/wav",
+  };
+
+  function pathOf(url) {
+    try {
+      return new URL(url).pathname.toLowerCase();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function extension(url) {
+    const p = pathOf(url);
+    const dot = p.lastIndexOf(".");
+    return dot > p.lastIndexOf("/") ? p.slice(dot + 1) : "";
+  }
+
+  /** "hls", "dash", "file" or null: what a link (and the Content-Type it came with, if known) is. */
+  function kindOf(url, contentType) {
+    if (!/^https?:/i.test(url || "")) return null;
+    const c = (contentType || "").toLowerCase().split(";")[0].trim();
+    const ext = extension(url);
+    if (c.includes("mpegurl") || ext === "m3u8") return "hls";
+    if (c === "application/dash+xml" || ext === "mpd") return "dash";
+    if (FILE_TYPES[ext] || /^(video|audio)\//.test(c)) return "file";
+    return null;
+  }
+
+  /** The MIME type to tell the receiver for a link, "" when the receiver had better sniff it. */
+  function mimeOf(url, kind, contentType) {
+    if (kind === "hls" || kind === "dash") return MIME[kind];
+    const c = (contentType || "").toLowerCase().split(";")[0].trim();
+    if (/^(video|audio)\//.test(c)) return c;
+    return FILE_TYPES[extension(url)] || "";
+  }
+
+  /**
+   * Hosts the TV cannot be expected to reach on its own: loopback, link-local, private and CGNAT addresses,
+   * names without a dot and names under the local suffixes networks use (a company's intranet behind a VPN).
+   */
+  function isPrivateHost(host) {
+    let h = (host || "").toLowerCase().replace(/^\[|\]$/g, "");
+    if (!h) return true;
+    if (h === "localhost" || !h.includes(".") && !h.includes(":")) return true;
+    if (/\.(local|lan|home|internal|intranet|corp|home\.arpa|localdomain|test)$/.test(h)) return true;
+    const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (v4) {
+      const [a, b] = [Number(v4[1]), Number(v4[2])];
+      return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+        || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+    }
+    if (h.includes(":")) return h === "::1" || /^f[cd]/.test(h) || /^fe[89ab]/.test(h);
+    return false;
+  }
+
+  function hostOf(url) {
+    try {
+      return new URL(url).hostname;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /**
+   * "direct" when the TV can fetch the link itself, "sender" when this computer has to pass it on: a private
+   * host, or a person's choice ("always" / "never" relay).
+   */
+  function chooseVia(mediaUrl, prefer) {
+    if (prefer === "always") return "sender";
+    if (prefer === "never") return "direct";
+    return isPrivateHost(hostOf(mediaUrl)) ? "sender" : "direct";
+  }
+
+  /**
+   * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
+   * page fetched for it: an HLS playlist (a master one first), then DASH, then a plain file. `video` is
+   * {currentSrc, src, sources: [{src, type}]}; `seen` the media links the page loaded, oldest first:
+   * [{url, kind, type}]. Returns {url, kind, mime} or null.
+   */
+  function pickSource(video, seen) {
+    const own = [video && video.currentSrc, video && video.src]
+      .concat(((video && video.sources) || []).map((s) => s.src))
+      .filter((u) => kindOf(u));
+    if (own.length) {
+      const url = own[0];
+      const type = ((video.sources || []).find((s) => s.src === url) || {}).type;
+      const kind = kindOf(url, type);
+      return { url, kind, mime: mimeOf(url, kind, type) };
+    }
+    const list = (seen || []).filter((s) => s && s.kind);
+    const hls = list.filter((s) => s.kind === "hls");
+    if (hls.length) {
+      const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || hls[0];
+      return { url: master.url, kind: "hls", mime: MIME.hls };
+    }
+    const dash = list.filter((s) => s.kind === "dash");
+    if (dash.length) {
+      const d = dash[dash.length - 1];
+      return { url: d.url, kind: "dash", mime: MIME.dash };
+    }
+    const files = list.filter((s) => s.kind === "file");
+    if (files.length) {
+      const f = files[files.length - 1];
+      return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
+    }
+    return null;
+  }
+
+  /**
+   * The Cast options for luchd (docs/dbus.md). The page's cookies (the site's login) go when this computer relays
+   * the link, where they stay on it, or to a TV the person trusts with them (`trusted`: their own TV at home);
+   * never to any other TV.
+   */
+  function castOptions(o) {
+    const out = {
+      title: (o.title || "").slice(0, 200),
+      start: Math.max(0, Math.floor((o.currentTime || 0) * 10) / 10),
+      via: o.via,
+    };
+    if (o.mime) out.mime = o.mime;
+    if (o.playbackRate && o.playbackRate !== 1) out.rate = o.playbackRate;
+    if (o.paused) out.paused = true;
+    if (o.poster && /^https?:/.test(o.poster)) out.poster = o.poster;
+    const headers = {};
+    if (o.pageUrl && /^https?:/.test(o.pageUrl)) {
+      headers.Referer = o.pageUrl;
+      try {
+        headers.Origin = new URL(o.pageUrl).origin;
+      } catch (e) {
+        // no origin
+      }
+    }
+    if (o.userAgent) headers["User-Agent"] = o.userAgent;
+    if (o.cookie && (o.via === "sender" || o.trusted)) headers.Cookie = o.cookie;
+    out.headers = headers;
+    const subs = (o.subs || []).filter((s) => /^https?:/.test(s));
+    if (subs.length) out.subs = subs;
+    return out;
+  }
+
+  /** After a direct cast: relay instead when the receiver could not fetch the link itself. */
+  function shouldRetryRelayed(via, state) {
+    if (via !== "direct" || !state) return false;
+    return state.state === "error" || state.code === "bad_link";
+  }
+
+  function clock(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = s % 60;
+    const two = (n) => String(n).padStart(2, "0");
+    return h ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+  }
+
+  /** Where playback is now: the receiver's last position moved on by the time since, at its speed. */
+  function positionNow(state, receivedAt, now) {
+    if (!state || typeof state.pos !== "number") return 0;
+    if (state.state !== "playing") return state.pos;
+    const p = state.pos + ((now - receivedAt) / 1000) * (state.rate || 1);
+    return typeof state.dur === "number" ? Math.min(p, state.dur) : p;
+  }
+
+  const api = { kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+    positionNow, MIME };
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.LuchCore = api;
+})(typeof self !== "undefined" ? self : this);

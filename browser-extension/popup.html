@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body{margin:0;padding:14px;width:300px;background:#121318;color:#e3e2e8;font:13px/1.4 system-ui,sans-serif}
+  h1{font-size:15px;margin:0 0 10px;color:#ffba5f}
+  label{display:flex;gap:8px;align-items:center;padding:6px;border-radius:8px;cursor:pointer}
+  label:hover{background:#1e1f24}
+  small{color:#c4c6d0}
+  button{width:100%;margin-top:10px;padding:8px;border:0;border-radius:10px;background:#ffba5f;color:#472a00;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  select{width:100%;margin-top:8px;background:#292a2f;color:#e3e2e8;border:1px solid #47484d;border-radius:8px;padding:5px}
+  .err{color:#ffb4ab;margin-top:8px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+  <h1>Luch</h1>
+  <div id="list"><small id="wait"></small></div>
+  <button id="cast" disabled></button>
+  <select id="relay"></select>
+  <div class="err" id="err"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

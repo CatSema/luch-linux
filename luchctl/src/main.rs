@@ -3,6 +3,8 @@
 use futures_util::StreamExt;
 use luch_proto::ReceiverRow;
 
+mod native;
+
 #[zbus::proxy(
     interface = "dev.luch.Luch1",
     default_service = "dev.luch.Luch1",
@@ -42,12 +44,14 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
-                | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]]
+                | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
+                | browser install]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
        cast: photos, or a video or sound the receiver plays itself in its own quality; a link is fetched by the
-       receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state";
+       receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
+       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -428,6 +432,20 @@ async fn run(args: &[String]) -> Result<(), String> {
                 print(&p.receivers().await.map_err(e)?);
             }
         }
+        ["browser", "install"] => {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+            let done = native::install(&exe.to_string_lossy(), &home).map_err(|e| e.to_string())?;
+            if done.is_empty() {
+                println!("no Chrome, Chromium, Brave, Edge, Yandex or Firefox profile found");
+            }
+            for f in done {
+                println!("{f}");
+            }
+            println!(
+                "now add the Luch extension to the browser (browser-extension/ in this repository)"
+            );
+        }
         [] => tui(&p).await.map_err(e)?,
         _ => return Err(USAGE.into()),
     }
@@ -675,6 +693,26 @@ async fn tui(p: &Luch1Proxy<'_>) -> zbus::Result<()> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Started by a browser for the extension: Chromium passes the extension's origin, Firefox the manifest's path
+    // and the extension's id.
+    if args
+        .first()
+        .is_some_and(|a| a.starts_with("chrome-extension://"))
+        || args.get(1).is_some_and(|a| a == "luch@toxblh.github.io")
+    {
+        let r = async {
+            let conn = zbus::Connection::session()
+                .await
+                .map_err(|e| e.to_string())?;
+            let p = Luch1Proxy::new(&conn).await.map_err(|e| e.to_string())?;
+            native::run(p).await
+        };
+        if let Err(msg) = r.await {
+            eprintln!("luchctl native host: {msg}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(msg) = run(&args).await {
         eprintln!("luchctl: {msg}");
         std::process::exit(1);

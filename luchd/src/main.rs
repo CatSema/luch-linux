@@ -71,6 +71,8 @@ struct State {
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
     audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
     playing: HashMap<String, Value>, // id -> last media_state of what it plays for us (PROTOCOL.md 4b)
+    /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
+    stopped: std::collections::HashSet<String>,
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -550,8 +552,26 @@ impl Luch {
     }
 
     /// Ends what the receiver plays or shows for us (media or photos).
-    async fn stop_cast(&self, id: String) -> fdo::Result<()> {
+    async fn stop_cast(
+        &self,
+        id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
         self.send_to(&id, json!({"t": "stop"})).await?;
+        // The receiver does not answer a sender's stop: the end is told here.
+        let was = {
+            let mut s = self.st.lock().await;
+            s.stopped.insert(id.clone());
+            s.playing.remove(&id).is_some()
+        };
+        if was {
+            media_changed(
+                conn,
+                &id,
+                &json!({"t": "media_state", "state": "stopped", "reason": "sender"}),
+            )
+            .await;
+        }
         let addrs = self.st.lock().await.conns.get(&id).and_then(|c| c.addrs);
         if let (Some(srv), Some((_, tv))) = (self.files.get(), addrs) {
             srv.forget(tv);
@@ -763,7 +783,11 @@ async fn run_channel(
                         eprintln!("[luchd] {name}: error {v}");
                         let _ = events.send(v);
                     }
-                    "ready" | "keyframe" | "stats" | "media_ready" | "photo_ready" | "sleeping" => {
+                    "media_ready" => {
+                        st.lock().await.stopped.remove(&id);
+                        let _ = events.send(v);
+                    }
+                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" => {
                         let _ = events.send(v);
                     }
                     "stop" => {
@@ -776,7 +800,13 @@ async fn run_channel(
                         let _ = events.send(v);
                     }
                     "media_state" => {
-                        st.lock().await.playing.insert(id.clone(), v.clone());
+                        {
+                            let mut s = st.lock().await;
+                            if s.stopped.contains(&id) {
+                                continue;
+                            }
+                            s.playing.insert(id.clone(), v.clone());
+                        }
                         media_changed(&conn, &id, &v).await;
                         let _ = events.send(v);
                     }

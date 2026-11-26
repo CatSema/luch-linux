@@ -154,6 +154,9 @@ subtitles); luchctl and the D-Bus API see the same state. Local files are served
 receiver only; `--relay` passes a link through luchd too, for links only this computer can open (a company VPN, a
 site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS and HLS; DASH is not supported yet.
 
+**From the browser.** The extension in [browser-extension/](browser-extension/README.md) puts a *To TV* button on
+every web video and the TV's controls over the page's player (`luchctl browser install` connects it to luchd).
+
 **Sound on older receivers.** Android 5 and 6 cannot make the receiver's sound short: it trails the picture by
 its audio buffer (`luchctl info` says how much). `auto`, the default, then holds the picture back to match
 (`sync`); `on` keeps the picture fastest and lets the sound lag; `off` sends the picture only. On Android 7 and

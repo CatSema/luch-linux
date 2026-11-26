@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
+      - name: Test the browser extension's logic
+        run: node --test browser-extension/test/core.test.js
+
       - name: Package
         run: |
           name=luch-linux-${GITHUB_REF_NAME//\//-}-x86_64
