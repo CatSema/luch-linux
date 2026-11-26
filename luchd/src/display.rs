@@ -171,7 +171,9 @@ impl Layout {
                     .is_some_and(|m| m.1 == size.width as i32 && m.2 == size.height as i32)
                 {
                     let connector = monitor.0 .0.clone();
-                    match place_right(&state, &connector, &self.before_layout) {
+                    let keep =
+                        with_newcomers(&state, &self.before_layout, &self.before, &connector);
+                    match place_right(&state, &connector, &keep) {
                         Ok(None) => return Ok(connector), // GNOME already placed it on the right.
                         Ok(Some(logical)) => {
                             let props = apply_props(&state)?;
@@ -214,7 +216,8 @@ impl Layout {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let state = state(&self.conn).await?;
-        let applied = applied_from_snapshots(&state, &self.before_layout)?;
+        let keep = with_newcomers(&state, &self.before_layout, &self.before, connector);
+        let applied = applied_from_snapshots(&state, &keep)?;
         if applied.is_empty() || layout_matches(&applied, &state) {
             return Ok(());
         }
@@ -231,6 +234,26 @@ impl Layout {
             .map_err(|e| format!("GNOME display layout: {e}"))?;
         Ok(())
     }
+}
+
+/// The captured layout plus the logical monitors that appeared since and are not `own`: the virtual monitor
+/// of another receiver's session, or a display plugged in meanwhile. Applying the captured layout alone would
+/// switch them off.
+fn with_newcomers(
+    state: &State,
+    before: &[LogicalSnapshot],
+    known: &HashSet<String>,
+    own: &str,
+) -> Vec<LogicalSnapshot> {
+    let mut all = before.to_vec();
+    all.extend(
+        state
+            .2
+            .iter()
+            .filter(|l| l.5.iter().all(|s| !known.contains(&s.0) && s.0 != own))
+            .filter_map(|l| snapshot(state, l)),
+    );
+    all
 }
 
 /// The physical monitors exactly as captured, with the modes that were active then.
@@ -268,10 +291,17 @@ fn applied_from_snapshots(
     Ok(applied)
 }
 
-/// Whether a config would leave the current layout exactly as it is.
+/// Whether a config would leave the current layout exactly as it is, in whatever order Mutter lists it.
 fn layout_matches(applied: &[Applied], state: &State) -> bool {
     applied.len() == state.2.len()
-        && applied.iter().zip(&state.2).all(|(a, l)| {
+        && applied.iter().all(|a| {
+            let Some(l) = a
+                .5
+                .first()
+                .and_then(|(conn, _, _)| state.2.iter().find(|l| l.5.iter().any(|s| &s.0 == conn)))
+            else {
+                return false;
+            };
             a.0 == l.0
                 && a.1 == l.1
                 && a.2 == l.2
@@ -651,5 +681,66 @@ mod tests {
         assert_eq!(applied.len(), 2);
         assert_eq!((applied[1].0, applied[1].5[0].0.as_str()), (3440, "second"));
         assert!(!layout_matches(&applied, &state));
+    }
+    fn known(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+    #[test]
+    fn stopping_one_extend_keeps_another_receivers_virtual_monitor() {
+        // Session A extended to Meta-0, then session B to Meta-1; A has stopped and Meta-0 is gone.
+        let main = monitor("main", 2560, 1440);
+        let other = monitor("Meta-1", 1920, 1080);
+        let logical = vec![
+            (0, 0, 1.0, 0, true, vec![main.0.clone()], Props::new()),
+            (2560, 0, 1.0, 0, false, vec![other.0.clone()], Props::new()),
+        ];
+        let state = (1, vec![main, other], logical, Props::new());
+        let before = vec![snap("main", 0, 0, 1.0, 0, true, 2560)];
+        let keep = with_newcomers(&state, &before, &known(&["main"]), "Meta-0");
+        let applied = applied_from_snapshots(&state, &keep).unwrap();
+        assert!(
+            applied.iter().any(|l| l.0 == 2560 && l.5[0].0 == "Meta-1"),
+            "{applied:?}"
+        );
+        assert!(layout_matches(&applied, &state), "nothing to change");
+    }
+    #[test]
+    fn a_virtual_monitor_goes_right_of_one_that_appeared_meanwhile() {
+        let main = monitor("main", 2560, 1440);
+        let other = monitor("Meta-1", 1920, 1080);
+        let ours = monitor("Meta-2", 1280, 720);
+        let logical = vec![
+            (0, 0, 1.0, 0, true, vec![main.0.clone()], Props::new()),
+            (2560, 0, 1.0, 0, false, vec![other.0.clone()], Props::new()),
+            (0, 1440, 1.0, 0, false, vec![ours.0.clone()], Props::new()),
+        ];
+        let state = (1, vec![main, other, ours], logical, Props::new());
+        let before = vec![snap("main", 0, 0, 1.0, 0, true, 2560)];
+        let keep = with_newcomers(&state, &before, &known(&["main"]), "Meta-2");
+        let applied = place_right(&state, "Meta-2", &keep).unwrap().unwrap();
+        let at = |name: &str| {
+            applied
+                .iter()
+                .find(|l| l.5[0].0 == name)
+                .map(|l| (l.0, l.1))
+        };
+        assert_eq!(at("Meta-1"), Some((2560, 0)));
+        assert_eq!(at("Meta-2"), Some((4480, 0)));
+    }
+    #[test]
+    fn the_same_layout_listed_in_another_order_matches() {
+        let left = monitor("left", 2560, 1440);
+        let right = monitor("right", 1920, 1080);
+        let logical = vec![
+            (2560, 0, 1.0, 0, false, vec![right.0.clone()], Props::new()),
+            (0, 0, 1.0, 0, true, vec![left.0.clone()], Props::new()),
+        ];
+        let state = (1, vec![left, right], logical, Props::new());
+        let before = vec![
+            snap("left", 0, 0, 1.0, 0, true, 2560),
+            snap("right", 2560, 0, 1.0, 0, false, 1920),
+        ];
+        let applied = applied_from_snapshots(&state, &before).unwrap();
+        assert!(layout_matches(&applied, &state));
     }
 }
