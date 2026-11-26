@@ -70,6 +70,8 @@ pub struct Target {
     pub ws: Option<mpsc::Sender<Vec<u8>>>,
     /// The `audio` part of `start` (limits::start_audio), or None for the picture only.
     pub audio: Option<Value>,
+    /// Sound only, like a speaker (PROTOCOL.md 4d): no capture of the screen, no video stream.
+    pub audio_only: bool,
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -1205,7 +1207,7 @@ pub async fn run(
     } else {
         None
     };
-    let portal = if t.kms || t.niri_virtual {
+    let portal = if t.kms || t.niri_virtual || t.audio_only {
         None
     } else {
         Some(portal(t.source).await?)
@@ -1229,8 +1231,12 @@ pub async fn run(
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
-    let mut start = json!({"t": "start", "mode": "mirror",
-        "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}});
+    let mut start = if t.audio_only {
+        json!({"t": "start", "mode": "audio"})
+    } else {
+        json!({"t": "start", "mode": "mirror",
+            "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}})
+    };
     if let Some(a) = &t.audio {
         start["audio"] = a.clone();
     }

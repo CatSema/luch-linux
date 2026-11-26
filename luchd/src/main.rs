@@ -7,7 +7,9 @@ mod display;
 mod enc;
 mod limits;
 mod mirror;
+mod mpris;
 mod reports;
+mod volume;
 mod wake;
 mod web_tls;
 
@@ -71,6 +73,8 @@ struct State {
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
     audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
     playing: HashMap<String, Value>, // id -> last media_state of what it plays for us (PROTOCOL.md 4b)
+    volumes: HashMap<String, Value>, // id -> the receiver's last {"level","muted"} (PROTOCOL.md 4e)
+    docs: HashMap<String, (u64, u64)>, // id -> (page, pages) of the document it shows for us (4g)
     /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
     stopped: std::collections::HashSet<String>,
 }
@@ -89,8 +93,6 @@ async fn answers(address: &str, port: u16) -> bool {
 
 struct Luch {
     st: Shared,
-    /// Serves cast files and relayed links to receivers; started on the first Cast.
-    files: Arc<tokio::sync::OnceCell<cast::Server>>,
     sender_id: String,
     host: String,
     discovery: discovery::Discovery,
@@ -479,13 +481,30 @@ impl Luch {
         let (me, tv) = c
             .addrs
             .ok_or_else(|| fdo::Error::NotSupported("the web receiver cannot play media".into()))?;
-        let srv = self
-            .files
-            .get_or_try_init(cast::Server::start)
+        let srv = files()
             .await
             .map_err(|e| fdo::Error::Failed(format!("cannot serve files: {e}")))?;
+        // Documents that are not PDF yet are turned into PDF first (LibreOffice; takes a few seconds).
+        let mut items = items;
+        for i in items.iter_mut() {
+            if cast::kind_of(i) == cast::Kind::Document && !i.to_ascii_lowercase().ends_with(".pdf")
+            {
+                let path = std::path::PathBuf::from(i.strip_prefix("file://").unwrap_or(i));
+                let out = std::env::temp_dir().join(format!("luch-doc-{}", std::process::id()));
+                let pdf = tokio::task::spawn_blocking(move || cast::to_pdf(&path, &out))
+                    .await
+                    .map_err(|e| fdo::Error::Failed(e.to_string()))?
+                    .map_err(fdo::Error::Failed)?;
+                *i = pdf.to_string_lossy().into_owned();
+            }
+        }
         let msg = cast::build(&items, &o, srv, tv, me).map_err(fdo::Error::InvalidArgs)?;
-        let kind = msg["t"].as_str().unwrap_or("").to_string();
+        let wire_kind = msg["t"].as_str().unwrap_or("").to_string();
+        let kind = if wire_kind == "open_app" {
+            "app".to_string()
+        } else {
+            wire_kind.clone()
+        };
         let mut events = c.events.subscribe();
         c.cmd
             .send(Cmd::Send(msg))
@@ -494,10 +513,22 @@ impl Luch {
         let answer = timeout(Duration::from_secs(10), async {
             loop {
                 match events.recv().await {
-                    Ok(v) if v["t"] == "media_ready" || v["t"] == "photo_ready" => return Ok(()),
+                    Ok(v)
+                        if v["t"] == "media_ready"
+                            || v["t"] == "photo_ready"
+                            || v["t"] == "doc_ready"
+                            || v["t"] == "app_opened" =>
+                    {
+                        return Ok(())
+                    }
+                    Ok(v)
+                        if v["t"] == "error" && v["for"] == "open_app" && v["code"] == "no_app" =>
+                    {
+                        return Err("the TV has no YouTube app".to_string())
+                    }
                     Ok(v)
                         if v["t"] == "error"
-                            && v["for"] == kind.as_str()
+                            && v["for"] == wire_kind.as_str()
                             && v["code"] == "unknown" =>
                     {
                         return Err(format!(
@@ -506,7 +537,7 @@ impl Luch {
                     }
                     Ok(v)
                         if v["t"] == "error"
-                            && (v["for"] == kind.as_str() || v["for"].is_null()) =>
+                            && (v["for"] == wire_kind.as_str() || v["for"].is_null()) =>
                     {
                         return Err(format!(
                             "{}{}",
@@ -573,7 +604,7 @@ impl Luch {
             .await;
         }
         let addrs = self.st.lock().await.conns.get(&id).and_then(|c| c.addrs);
-        if let (Some(srv), Some((_, tv))) = (self.files.get(), addrs) {
+        if let (Some(srv), Some((_, tv))) = (FILES.get(), addrs) {
             srv.forget(tv);
         }
         Ok(())
@@ -609,6 +640,97 @@ impl Luch {
         .await
         .map_err(|_| fdo::Error::Failed("the receiver did not answer".into()))?;
         r.map_err(fdo::Error::Failed)
+    }
+
+    /// Sets the receiver's volume (connecting first if needed): "0".."100", "+", "-", "mute", "unmute". Returns its
+    /// volume after the change as JSON {"level","muted"}.
+    async fn set_volume(
+        &self,
+        id: String,
+        what: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let msg = volume::message(&what).map_err(fdo::Error::InvalidArgs)?;
+        if !self.st.lock().await.conns.contains_key(&id) {
+            self.connect(id.clone(), conn).await?;
+        }
+        let c = self.st.lock().await.conns.get(&id).cloned();
+        let c = c.ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+        let mut events = c.events.subscribe();
+        let _ = c.cmd.send(Cmd::Send(msg)).await;
+        let r = timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await {
+                    Ok(v) if v["t"] == "volume" => return Ok(v),
+                    Ok(v) if v["t"] == "error" && v["for"] == "volume" => {
+                        return Err(if v["code"] == "unknown" {
+                            "this receiver version cannot set its volume yet: update it".to_string()
+                        } else {
+                            "the TV keeps its volume to itself".to_string()
+                        })
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return Err("channel closed".to_string()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| fdo::Error::Failed("the receiver did not answer".into()))?;
+        let mut v = r.map_err(fdo::Error::Failed)?;
+        if let Some(o) = v.as_object_mut() {
+            o.remove("t");
+        }
+        Ok(v.to_string())
+    }
+
+    /// Turns the page of the document the receiver shows: "next", "prev" or a page number from 1. Returns
+    /// "page/pages".
+    async fn doc_page(&self, id: String, what: String) -> fdo::Result<String> {
+        let (page, pages) = self
+            .st
+            .lock()
+            .await
+            .docs
+            .get(&id)
+            .copied()
+            .unwrap_or((0, 0));
+        if pages == 0 {
+            return Err(fdo::Error::Failed("no document on that receiver".into()));
+        }
+        let to = match what.as_str() {
+            "next" | "+" => (page + 1).min(pages - 1),
+            "prev" | "-" => page.saturating_sub(1),
+            n => n
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (1..=pages).contains(n))
+                .map(|n| n - 1)
+                .ok_or_else(|| fdo::Error::InvalidArgs(format!("page 1..{pages}, next or prev")))?,
+        };
+        self.send_to(&id, json!({"t": "doc_page", "page": to}))
+            .await?;
+        Ok(format!("{}/{pages}", to + 1))
+    }
+
+    /// The receiver's last known volume as JSON, "{}" until it told one.
+    async fn get_volume(&self, id: String) -> String {
+        let s = self.st.lock().await;
+        s.volumes
+            .get(&id)
+            .cloned()
+            .or_else(|| {
+                s.welcomes
+                    .get(&id)
+                    .map(|w| w["volume"].clone())
+                    .filter(|v| v.is_object())
+            })
+            .map(|mut v| {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("t");
+                }
+                v.to_string()
+            })
+            .unwrap_or_else(|| "{}".into())
     }
 
     #[zbus(signal)]
@@ -787,7 +909,20 @@ async fn run_channel(
                         st.lock().await.stopped.remove(&id);
                         let _ = events.send(v);
                     }
-                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" => {
+                    "doc_ready" | "doc_page" => {
+                        {
+                            let mut s = st.lock().await;
+                            let d = s.docs.entry(id.clone()).or_insert((0, 0));
+                            if let Some(n) = v["pages"].as_u64() {
+                                *d = (0, n);
+                            }
+                            if let Some(p) = v["page"].as_u64() {
+                                d.0 = p;
+                            }
+                        }
+                        let _ = events.send(v);
+                    }
+                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" => {
                         let _ = events.send(v);
                     }
                     "stop" => {
@@ -798,6 +933,21 @@ async fn run_channel(
                                                                "reason": v["reason"]})).await;
                         }
                         let _ = events.send(v);
+                    }
+                    "volume" => {
+                        st.lock().await.volumes.insert(id.clone(), v.clone());
+                        let _ = events.send(v);
+                    }
+                    "media_key" => {
+                        // The TV's remote, for the player on this computer (PROTOCOL.md 4d).
+                        let key = v["key"].as_str().unwrap_or("").to_string();
+                        let (st, conn, id) = (st.clone(), conn.clone(), id.clone());
+                        tokio::spawn(async move {
+                            if mpris::key(&conn, &key).await {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                push_now_playing(&st, &conn, Some(&id)).await;
+                            }
+                        });
                     }
                     "media_state" => {
                         {
@@ -846,6 +996,82 @@ async fn run_channel(
     changed(&conn).await;
 }
 
+/// Serves cast files, relayed links and covers to receivers; started when first needed.
+static FILES: tokio::sync::OnceCell<cast::Server> = tokio::sync::OnceCell::const_new();
+
+async fn files() -> io::Result<&'static cast::Server> {
+    FILES.get_or_try_init(cast::Server::start).await
+}
+
+/// What the player on this computer plays, to every receiver that has a session with us (or only `only`):
+/// `now_playing` (PROTOCOL.md 4d), its cover shared with each receiver.
+async fn push_now_playing(st: &Shared, conn: &Connection, only: Option<&str>) {
+    let targets: Vec<(String, Conn)> = {
+        let s = st.lock().await;
+        s.mirrors
+            .keys()
+            .filter(|id| only.is_none_or(|o| o == id.as_str()))
+            .filter_map(|id| s.conns.get(id).map(|c| (id.clone(), c.clone())))
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let Some((np, art)) = mpris::now(conn).await else {
+        return;
+    };
+    for (_, c) in targets {
+        let mut msg = np.clone();
+        msg["t"] = json!("now_playing");
+        if let (Some(a), Some((me, tv))) = (&art, c.addrs) {
+            if let Ok(srv) = files().await {
+                let item = if let Some(path) = a.strip_prefix("file://") {
+                    let path = path.replace("%20", " ");
+                    std::path::Path::new(&path)
+                        .is_file()
+                        .then(|| cast::Item::File(path.into()))
+                } else if a.starts_with("http://") || a.starts_with("https://") {
+                    Some(cast::Item::Relay {
+                        url: a.clone(),
+                        headers: vec![],
+                    })
+                } else {
+                    None
+                };
+                if let Some(item) = item {
+                    let t = srv.share(item, tv, "image/jpeg");
+                    msg["art"] = json!(srv.url(me, &t, "cover.jpg"));
+                }
+            }
+        }
+        let _ = c.cmd.send(Cmd::Send(msg)).await;
+    }
+}
+
+/// Follows the players' changes and tells the receivers that have a session (at most every 300 ms).
+async fn follow_players(st: Shared, conn: Connection) {
+    let rule = match MatchRule::builder()
+        .msg_type(MsgType::Signal)
+        .interface("org.freedesktop.DBus.Properties")
+        .and_then(|b| b.member("PropertiesChanged"))
+        .and_then(|b| b.path("/org/mpris/MediaPlayer2"))
+    {
+        Ok(b) => b.build(),
+        Err(_) => return,
+    };
+    let Ok(mut stream) = MessageStream::for_match_rule(rule, &conn, None).await else {
+        return;
+    };
+    while stream.next().await.is_some() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Whatever came meanwhile is folded into this one push.
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1), stream.next()).await
+        {
+        }
+        push_now_playing(&st, &conn, None).await;
+    }
+}
+
 async fn media_changed(conn: &Connection, id: &str, state: &Value) {
     if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
         let _ = Luch::media_state_changed(&e, id, &state.to_string()).await;
@@ -863,15 +1089,18 @@ async fn start_mirror(
     requested: (u32, u32),
 ) -> fdo::Result<()> {
     let mirror169 = source == "fast169";
+    let audio_only = source == "audio";
     let kms = source == "fast" || mirror169;
     let niri_virtual = source == "virtual" && mirror::niri_virtual_available();
     let source = match source {
-        "" | "monitor" | "fast" | "fast169" => ashpd::desktop::screencast::SourceType::MONITOR,
+        "" | "monitor" | "fast" | "fast169" | "audio" => {
+            ashpd::desktop::screencast::SourceType::MONITOR
+        }
         "window" => ashpd::desktop::screencast::SourceType::WINDOW,
         "virtual" => ashpd::desktop::screencast::SourceType::VIRTUAL,
         s => {
             return Err(fdo::Error::InvalidArgs(format!(
-                "source must be fast|monitor|window|virtual, not {s}"
+                "source must be fast|monitor|window|virtual|audio, not {s}"
             )))
         }
     };
@@ -933,11 +1162,22 @@ async fn start_mirror(
         display::Size::default()
     };
     let ws = c.media.clone();
-    let audio = limits::start_audio(
-        &audio_choice(st, id).await,
-        &welcome,
-        mirror::AUDIO_FRAME_MS,
-    );
+    // Sound only always carries sound, whatever the person chose for mirroring.
+    let chosen_audio = if audio_only {
+        "on".to_string()
+    } else {
+        audio_choice(st, id).await
+    };
+    let audio = limits::start_audio(&chosen_audio, &welcome, mirror::AUDIO_FRAME_MS);
+    if audio_only
+        && !welcome["modes"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|x| x == "audio"))
+    {
+        return Err(fdo::Error::NotSupported(
+            "this receiver version cannot play sound only yet: update it".into(),
+        ));
+    }
     let address = r
         .address
         .parse()
@@ -954,6 +1194,7 @@ async fn start_mirror(
         niri_virtual,
         mirror169,
         audio,
+        audio_only,
     };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
@@ -970,6 +1211,13 @@ async fn start_mirror(
     let events_rx = events.subscribe();
     drop(events);
     let name = target.name.clone();
+    {
+        let (st, conn, id) = (st.clone(), conn.clone(), id.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await; // once the receiver is ready
+            push_now_playing(&st, &conn, Some(&id)).await;
+        });
+    }
     tokio::spawn(async move {
         let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
         match res {
@@ -1565,7 +1813,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             p::DBUS_PATH,
             Luch {
                 st: st.clone(),
-                files: Arc::default(),
                 sender_id: id.clone(),
                 host: host.clone(),
                 discovery,
@@ -1578,6 +1825,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         p::APP,
         p::RECEIVER_TYPE
     );
+    tokio::spawn(follow_players(st.clone(), conn.clone()));
+    {
+        // The volume keys while a session sends this computer's sound: to the receivers in a session.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(volume::follow(move |v| {
+            let _ = tx.send(v);
+        }));
+        let st = st.clone();
+        tokio::spawn(async move {
+            while let Some(v) = rx.recv().await {
+                let s = st.lock().await;
+                for id in s.mirrors.keys() {
+                    if let Some(c) = s.conns.get(id) {
+                        let _ = c.cmd.try_send(Cmd::Send(v.clone()));
+                    }
+                }
+            }
+        });
+    }
     tokio::spawn(serve_web(
         st.clone(),
         conn.clone(),

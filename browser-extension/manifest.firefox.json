@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Luch",
+  "version": "0.4.0",
+  "description": "Send a video from any web page to a TV with Luch: it plays there in its own quality, controlled from here or from the TV's remote.",
+  "permissions": [
+    "nativeMessaging",
+    "webRequest",
+    "webNavigation",
+    "cookies",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "core.js",
+      "background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Luch",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "luch@toxblh.github.io",
+      "strict_min_version": "121.0"
+    }
+  }
+}

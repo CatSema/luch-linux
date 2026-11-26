@@ -33,6 +33,9 @@ trait Luch1 {
     fn media_state(&self, id: &str) -> zbus::Result<String>;
     fn stop_cast(&self, id: &str) -> zbus::Result<()>;
     fn sleep(&self, id: &str) -> zbus::Result<()>;
+    fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn get_volume(&self, id: &str) -> zbus::Result<String>;
+    fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -46,17 +49,19 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
-                | browser install]
+                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
        cast: photos, or a video or sound the receiver plays itself in its own quality; a link is fetched by the
        receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
+       mirror audio: this computer's sound only, the TV as a speaker showing what plays (its remote's keys control
+       the player here); cast also takes PDF, office files, text and code (others through LibreOffice)
        browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
-const SOURCES: [&str; 4] = ["fast", "monitor", "window", "virtual"];
+const SOURCES: [&str; 5] = ["fast", "monitor", "window", "virtual", "audio"];
 
 fn print(rows: &[ReceiverRow]) {
     if rows.is_empty() {
@@ -224,6 +229,42 @@ async fn run(args: &[String]) -> Result<(), String> {
                 p.stop_cast(&id).await.map_err(e)?;
             }
         }
+        ["volume", rest @ ..] if rest.len() <= 2 => {
+            let is_word = |w: &str| {
+                matches!(w, "+" | "-" | "up" | "down" | "mute" | "unmute")
+                    || w.trim_end_matches('%').parse::<u8>().is_ok()
+            };
+            let (key, what) = match rest {
+                [] => (None, None),
+                [w] if is_word(w) => (None, Some(*w)),
+                [k] => (Some(*k), None),
+                [k, w] => (Some(*k), Some(*w)),
+                _ => unreachable!(),
+            };
+            let id = find_id(&p, key).await?;
+            let v = match what {
+                Some(w) => p.set_volume(&id, w).await.map_err(e)?,
+                None => p.get_volume(&id).await.map_err(e)?,
+            };
+            let v: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+            match v["level"].as_u64() {
+                Some(l) => println!("{l}%{}", if v["muted"] == true { " (muted)" } else { "" }),
+                None => println!("unknown until the receiver tells (luchctl volume <r> +)"),
+            }
+        }
+        ["page", rest @ ..] if !rest.is_empty() && rest.len() <= 2 => {
+            let (key, what) = if rest.len() == 2 {
+                (Some(rest[0]), rest[1])
+            } else {
+                (None, rest[0])
+            };
+            println!(
+                "{}",
+                p.doc_page(&find_id(&p, key).await?, what)
+                    .await
+                    .map_err(e)?
+            );
+        }
         ["sleep", key @ ..] if key.len() <= 1 => {
             p.sleep(&find_id(&p, key.first().copied()).await?)
                 .await
@@ -237,7 +278,15 @@ async fn run(args: &[String]) -> Result<(), String> {
             let (items, options) = cast_args(rest)?;
             let id = find_id(&p, key).await?;
             let kind = p.cast(&id, &items, &options.to_string()).await.map_err(e)?;
-            println!("{kind} on the receiver; `luchctl media` follows it");
+            println!(
+                "{}",
+                match kind.as_str() {
+                    "media" => "playing on the receiver; `luchctl media` follows it",
+                    "doc" => "the document is on the receiver; `luchctl page next` turns its pages",
+                    "app" => "opened in the TV's own app",
+                    _ => "on the receiver",
+                }
+            );
         }
         ["media", rest @ ..] => {
             let (key, words) = match rest {

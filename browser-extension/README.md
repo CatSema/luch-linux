@@ -10,7 +10,8 @@ sound track and subtitles. The TV's remote works too, and both stay in step.
 2. `luchctl browser install` lets the browser reach luchd. It writes a native messaging host manifest for every
    browser it finds, pointing at `luchctl`.
 3. Add the extension:
-   - **Firefox**: `about:debugging` → *This Firefox* → *Load Temporary Add-on…* → `browser-extension/manifest.json`.
+   - **Firefox**: `browser-extension/make-firefox.sh` builds `dist/firefox` (Firefox needs its own manifest);
+     then `about:debugging` → *This Firefox* → *Load Temporary Add-on…* → `dist/firefox/manifest.json`.
      Then in `about:addons` → Luch → *Permissions*, allow *Access your data for all websites*: Firefox asks for it
      separately, and without it the extension cannot see a page's videos.
    - **Chrome, Chromium, Brave, Edge**: `chrome://extensions` → *Developer mode* → *Load unpacked* →
@@ -48,6 +49,6 @@ How the video gets to the TV:
 
 ## Tests
 
-`node --test browser-extension/test/core.test.js` checks the decisions (`core.js`).
+`node --test browser-extension/test/*.test.js` checks the decisions (`core.js`) and the two manifests.
 `browser-extension/test/host_e2e.py <receiver id>` runs the native host the way a browser does, against a running
 luchd and a real TV.

@@ -56,9 +56,15 @@ function connect() {
 }
 
 function hostHint(why) {
-  return /not found|forbidden|specified native messaging host/i.test(why)
-    ? "Luch is not set up for this browser: run `luchctl browser install` and restart the browser"
-    : why;
+  if (/not found|forbidden|specified native messaging host/i.test(why)) {
+    return "Luch is not set up for this browser: run `luchctl browser install` and restart the browser";
+  }
+  if (/host has exited/i.test(why)) {
+    // A Flatpak browser whose wrapper may not leave the sandbox, or luchd not running.
+    return "The Luch host stopped at once: is luchd running? A Flatpak browser also needs "
+      + "`flatpak override --user --talk-name=org.freedesktop.Flatpak <its id>` (see the extension's README)";
+  }
+  return why;
 }
 
 function ask(op, fields, ms = 15000) {

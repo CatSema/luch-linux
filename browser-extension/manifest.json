@@ -4,13 +4,42 @@
   "version": "0.4.0",
   "description": "Send a video from any web page to a TV with Luch: it plays there in its own quality, controlled from here or from the TV's remote.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA9ThaXQUblUzgh46jNxL1dwVck76JGLe0CwuCrSRTH5sk9TEZleYq8cUC37tcbYZU3CExrGmeLefOrcdKc8XANoVsfs0RtlGObtN1ujiZLBAwOdzpyJbO2iRnuk3kGzRMFBk3GSADzFCPRxmxpWend4n53vDlbnxr7BoNbFWbcmHmrrGrSYLERdb+Mn3PnNoZhyBqDcUsnf1BjTiguHMhWVntTIRt6cwhfJCzt0cxn+5UWCZ35cCSoHvDQM1R1wK3WUjjrM9AtyMe8WO+D9GeextnqI9ApQa4IGzwzsTHKxYPJUQ96yi7CxkcgMni6e52wEnXFS6jKZh3CRZJEAcoaQIDAQAB",
-  "permissions": ["nativeMessaging", "webRequest", "webNavigation", "cookies", "storage", "activeTab"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js", "scripts": ["core.js", "background.js"] },
-  "content_scripts": [
-    { "matches": ["<all_urls>"], "js": ["content.js"], "all_frames": true, "run_at": "document_idle" }
+  "permissions": [
+    "nativeMessaging",
+    "webRequest",
+    "webNavigation",
+    "cookies",
+    "storage",
+    "activeTab"
   ],
-  "action": { "default_title": "Luch", "default_popup": "popup.html", "default_icon": { "48": "icon-48.png", "128": "icon-128.png" } },
-  "icons": { "48": "icon-48.png", "128": "icon-128.png" },
-  "browser_specific_settings": { "gecko": { "id": "luch@toxblh.github.io", "strict_min_version": "121.0" } }
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Luch",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
 }

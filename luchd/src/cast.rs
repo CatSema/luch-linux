@@ -537,8 +537,17 @@ pub enum Kind {
     Image,
     Media,
     Subtitle,
+    /// A PDF, or a document turned into one first (`to_pdf`).
+    Document,
     Unknown,
 }
+
+/// Extensions LibreOffice turns into PDF: office files, text and code (shown as plain text).
+const CONVERTIBLE: [&str; 40] = [
+    "doc", "docx", "odt", "rtf", "txt", "md", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "odp",
+    "odg", "fodt", "py", "rs", "js", "ts", "c", "h", "cpp", "hpp", "java", "go", "sh", "json",
+    "yaml", "yml", "toml", "xml", "html", "css", "kt", "swift", "rb", "php", "sql", "lua", "log",
+];
 
 fn extension(s: &str) -> String {
     let path = s.split(['?', '#']).next().unwrap_or(s);
@@ -572,11 +581,16 @@ pub fn mime_of(s: &str) -> &'static str {
         "heic" | "heif" => "image/heif",
         "vtt" => "text/vtt",
         "srt" => "application/x-subrip",
+        "pdf" => "application/pdf",
         _ => "",
     }
 }
 
 pub fn kind_of(s: &str) -> Kind {
+    let ext = extension(s);
+    if ext == "pdf" || (!is_url(s) && CONVERTIBLE.contains(&ext.as_str())) {
+        return Kind::Document;
+    }
     let m = mime_of(s);
     if m.starts_with("image/") {
         Kind::Image
@@ -663,8 +677,106 @@ fn absolute(s: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-/// The `media` or `photo` message for `items` (paths or http(s) links), sharing what needs sharing with `client`.
-/// `me` is this machine's address as the receiver reaches it.
+/// The video id and start time (s) of a YouTube link: watch, youtu.be, shorts, embed, live; `t=` as 90, 90s or 1m30s.
+pub fn youtube(url: &str) -> Option<(String, f64)> {
+    let u = url.split('#').next()?;
+    let (_, rest) = u.split_once("://")?;
+    let (host, path_query) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let host = host
+        .trim_start_matches("www.")
+        .trim_start_matches("m.")
+        .trim_start_matches("music.");
+    let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
+    let param = |k: &str| {
+        query.split('&').find_map(|kv| {
+            kv.split_once('=')
+                .filter(|(a, _)| *a == k)
+                .map(|(_, v)| v.to_string())
+        })
+    };
+    let id = match host {
+        "youtu.be" => path.split('/').next().map(String::from),
+        "youtube.com" | "youtube-nocookie.com" => {
+            let mut parts = path.split('/');
+            match parts.next() {
+                Some("watch") => param("v"),
+                Some("shorts" | "embed" | "live" | "v") => parts.next().map(String::from),
+                _ => None,
+            }
+        }
+        _ => None,
+    }?;
+    let ok = (6..=20).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        return None;
+    }
+    let start = param("t")
+        .or_else(|| param("start"))
+        .map(|t| youtube_time(&t))
+        .unwrap_or(0.0);
+    Some((id, start))
+}
+
+/// "90", "90s", "1m30s", "1h2m3s" in seconds.
+fn youtube_time(t: &str) -> f64 {
+    if let Ok(n) = t.parse::<f64>() {
+        return n;
+    }
+    let (mut total, mut num) = (0.0, String::new());
+    for c in t.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let n: f64 = num.parse().unwrap_or(0.0);
+        num.clear();
+        total += n * match c {
+            'h' => 3600.0,
+            'm' => 60.0,
+            _ => 1.0,
+        };
+    }
+    total + num.parse::<f64>().unwrap_or(0.0)
+}
+
+/// A document as PDF: a PDF as it is, anything else through LibreOffice (headless) into `out`. Blocking.
+pub fn to_pdf(path: &Path, out: &Path) -> Result<PathBuf, String> {
+    if extension(&path.to_string_lossy()) == "pdf" {
+        return Ok(path.to_path_buf());
+    }
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let office = ["soffice", "libreoffice"]
+        .into_iter()
+        .find(|c| {
+            std::process::Command::new(c)
+                .arg("--version")
+                .output()
+                .is_ok()
+        })
+        .ok_or("install LibreOffice to show this kind of document (PDF works without it)")?;
+    let r = std::process::Command::new(office)
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(out)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("{office}: {e}"))?;
+    let pdf = out.join(path.with_extension("pdf").file_name().unwrap_or_default());
+    if !r.status.success() || !pdf.is_file() {
+        return Err(format!(
+            "could not turn {} into PDF: {}",
+            path.display(),
+            String::from_utf8_lossy(&r.stderr).trim()
+        ));
+    }
+    Ok(pdf)
+}
+
+/// The `media`, `photo`, `doc` or `open_app` message for `items` (paths or http(s) links), sharing what needs sharing
+/// with `client`. `me` is this machine's address as the receiver reaches it. Documents must be PDF by now (`to_pdf`).
 pub fn build(
     items: &[String],
     o: &Options,
@@ -674,6 +786,32 @@ pub fn build(
 ) -> Result<Value, String> {
     if items.is_empty() {
         return Err("nothing to cast".into());
+    }
+    // A YouTube link plays in the TV's own YouTube app (PROTOCOL.md 4f): its stream is not to be had from a page.
+    if let [one] = items {
+        if let Some((id, t)) = youtube(one) {
+            let start = if o.start > 0.0 { o.start } else { t };
+            return Ok(json!({"t": "open_app", "app": "youtube", "id": id, "start": start}));
+        }
+    }
+    if let Some(d) = items.iter().find(|i| kind_of(i) == Kind::Document) {
+        if is_url(d) {
+            return Err("a document has to be a file on this computer".into());
+        }
+        let p = absolute(d)?;
+        if extension(&p.to_string_lossy()) != "pdf" {
+            return Err(format!("{}: not a PDF yet", p.display()));
+        }
+        let file = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = o.title.clone().unwrap_or_else(|| file.clone());
+        let t = srv.share(Item::File(p.clone()), client, "application/pdf");
+        return Ok(
+            json!({"t": "doc", "url": srv.url(me, &t, &file), "mime": "application/pdf",
+                         "name": name, "page": o.start.max(0.0) as u64}),
+        );
     }
     let photos = items.iter().all(|i| kind_of(i) == Kind::Image);
     if photos {
@@ -1034,6 +1172,98 @@ mod tests {
     }
 
     #[test]
+    fn youtube_links() {
+        let id = "dQw4w9WgXcQ";
+        for u in [
+            format!("https://www.youtube.com/watch?v={id}"),
+            format!("https://m.youtube.com/watch?feature=share&v={id}"),
+            format!("https://youtu.be/{id}"),
+            format!("https://www.youtube.com/shorts/{id}"),
+            format!("https://www.youtube-nocookie.com/embed/{id}?rel=0"),
+            format!("https://music.youtube.com/watch?v={id}&list=x"),
+        ] {
+            assert_eq!(youtube(&u).map(|(i, _)| i).as_deref(), Some(id), "{u}");
+        }
+        assert_eq!(
+            youtube(&format!("https://youtu.be/{id}?t=90")).unwrap().1,
+            90.0
+        );
+        assert_eq!(
+            youtube(&format!("https://www.youtube.com/watch?v={id}&t=1m30s"))
+                .unwrap()
+                .1,
+            90.0
+        );
+        assert_eq!(
+            youtube(&format!("https://www.youtube.com/watch?v={id}&t=1h2m3s"))
+                .unwrap()
+                .1,
+            3723.0
+        );
+        assert!(youtube("https://www.youtube.com/feed/subscriptions").is_none());
+        assert!(youtube("https://www.youtube.com/watch?v=../../etc").is_none());
+        assert!(youtube("https://notyoutube.com/watch?v=dQw4w9WgXcQ").is_none());
+    }
+
+    #[tokio::test]
+    async fn youtube_and_documents_become_their_own_messages() {
+        let (srv, _) = server().await;
+        let tv: IpAddr = "192.168.1.30".parse().unwrap();
+        let me: IpAddr = "192.168.1.20".parse().unwrap();
+        let yt = build(
+            &["https://youtu.be/dQw4w9WgXcQ?t=42".into()],
+            &Options::default(),
+            &srv,
+            tv,
+            me,
+        )
+        .unwrap();
+        assert_eq!(
+            yt,
+            json!({"t": "open_app", "app": "youtube", "id": "dQw4w9WgXcQ", "start": 42.0})
+        );
+        let pdf = temp_file("Report 1.pdf", b"%PDF-1.4");
+        let d = build(
+            &[pdf.to_string_lossy().into_owned()],
+            &Options::default(),
+            &srv,
+            tv,
+            me,
+        )
+        .unwrap();
+        assert_eq!(d["t"], "doc");
+        assert_eq!(d["name"], "Report 1.pdf");
+        assert!(d["url"].as_str().unwrap().ends_with("/Report%201.pdf"));
+        let docx = temp_file("a.docx", b"x");
+        assert!(build(
+            &[docx.to_string_lossy().into_owned()],
+            &Options::default(),
+            &srv,
+            tv,
+            me
+        )
+        .is_err());
+        assert_eq!(kind_of("main.rs"), Kind::Document);
+        assert_eq!(kind_of("https://x.example/a.txt"), Kind::Unknown);
+    }
+
+    #[test]
+    fn documents_turn_into_pdf_when_libreoffice_is_there() {
+        if std::process::Command::new("soffice")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("no LibreOffice: skipped");
+            return;
+        }
+        let txt = temp_file("notes.txt", "Luch\nпривет\n".as_bytes());
+        let out = txt.parent().unwrap().join("pdf");
+        let pdf = to_pdf(&txt, &out).unwrap();
+        assert!(std::fs::read(&pdf).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
     fn kinds_and_types() {
         assert_eq!(kind_of("/home/u/Видео/film.MKV"), Kind::Media);
         assert_eq!(
@@ -1042,7 +1272,8 @@ mod tests {
         );
         assert_eq!(kind_of("IMG_1.JPG"), Kind::Image);
         assert_eq!(kind_of("film.en.srt"), Kind::Subtitle);
-        assert_eq!(kind_of("notes.txt"), Kind::Unknown);
+        assert_eq!(kind_of("notes.txt"), Kind::Document);
+        assert_eq!(kind_of("archive.zip"), Kind::Unknown);
         assert_eq!(sub_lang("film.en.srt"), "en");
         assert_eq!(sub_lang("film.srt"), "");
     }
